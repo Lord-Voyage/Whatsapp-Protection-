@@ -177,3 +177,13 @@ test('pairing codes are requested only after WhatsApp offers a pairing challenge
   await assert.rejects(closed, /closed the connection/);
   await assert.rejects(testing.waitForPairingChallenge({ ev }, 20), /Timed out/);
 });
+
+test('pairing status polling is not throttled by the code-request limit', async () => {
+  for (let i = 0; i < 12; i += 1) assert.equal((await fetch(`${base}/api/pair-code/status?token=wrong`)).status, 403);
+  let limited = false;
+  for (let i = 0; i < 6; i += 1) {
+    const res = await fetch(`${base}/api/pair-code`, { method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify({ phone: STRANGER }) });
+    if (res.status === 429) limited = true;
+  }
+  assert.ok(limited, 'code requests are still rate limited');
+});

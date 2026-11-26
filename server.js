@@ -817,8 +817,8 @@ app.use((req, res, next) => {
   res.setHeader('Content-Security-Policy', "default-src 'self'; img-src 'self' data:; style-src 'self' 'unsafe-inline' https://fonts.googleapis.com; font-src 'self' https://fonts.gstatic.com; script-src 'self'; connect-src 'self'; frame-ancestors 'none'; base-uri 'self'; form-action 'self'");
   next();
 });
-const limitBuckets = new Map();
 function rateLimit({ limit = 5, windowMs = 60_000 } = {}) {
+  const limitBuckets = new Map();
   return (req, res, next) => {
     const key = req.ip || 'unknown'; const now = Date.now();
     const recent = (limitBuckets.get(key) || []).filter(t => now - t < windowMs);
@@ -827,7 +827,9 @@ function rateLimit({ limit = 5, windowMs = 60_000 } = {}) {
     recent.push(now); limitBuckets.set(key, recent); next();
   };
 }
-app.use('/api/pair-code', rateLimit({ limit: 5 }));
+// Code requests are strictly limited; status polling (every 1.5 s until linked) gets its own budget.
+const pairCodeRequestLimit = rateLimit({ limit: 5 });
+const pairStatusLimit = rateLimit({ limit: 90 });
 // Health reflects the web process and database only, so Render does not restart the service
 // just because WhatsApp is disconnected or not yet paired.
 app.get('/api/health', (_req, res) => {
@@ -838,7 +840,7 @@ app.get('/api/health', (_req, res) => {
 app.get('/api/status', (_req, res) => res.json({ status: currentStatus, connected: currentStatus === 'connected' }));
 // Website bootstrap pairing is restricted to OWNER_NUMBER. Additional accounts must
 // initiate /pair from their own private WhatsApp chat to prove control of that number.
-app.post('/api/pair-code', async (req, res) => {
+app.post('/api/pair-code', pairCodeRequestLimit, async (req, res) => {
   try {
     if (!process.env.OWNER_NUMBER) return res.status(503).json({ error: 'Set OWNER_NUMBER in the service environment before pairing the primary bot account.' });
     const phone = normalizePhone(req.body?.phone);
@@ -860,7 +862,7 @@ app.post('/api/pair-code', async (req, res) => {
     res.status(502).json({ error: error.message || 'Could not generate a primary device-linking code.' });
   }
 });
-app.get('/api/pair-code/status', (req, res) => {
+app.get('/api/pair-code/status', pairStatusLimit, (req, res) => {
   const token = String(req.query.token || '');
   if (!token || token !== primaryPairingToken || Date.now() > primaryPairingTokenExpires) return res.status(403).json({ error: 'Invalid or expired pairing request token.' });
   res.set('Cache-Control', 'no-store');
