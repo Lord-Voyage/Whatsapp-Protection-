@@ -9,7 +9,7 @@ WhatsApp Protection is a persistent Node.js service with an Express website, Bai
 - `/dashboard` public read-only service status page; protection settings are managed by the configured owner and successfully paired numbers through WhatsApp commands.
 - SQLite storage for linked numbers, protection settings, pairing history, activity logs and security events.
 - Baileys multi-file authentication under `DATA_DIR/auth` for the primary owner and `DATA_DIR/auth/linked/<phone>` for each additional linked account.
-- WhatsApp commands: `/pair`, `/menu`, `/developers`, `/activate ban_protection`, `/activate bug_protection`, `/activate soam_protection`.
+- WhatsApp commands: `/pair`, `/menu`, `/developers`, `/status`, `/activate <feature>` and `/deactivate <feature>` where `<feature>` is `ban_protection`, `bug_protection` or `soam_protection`. Settings are stored per phone number in SQLite. The owner sends commands from the bot account's own "Message yourself" chat; linked users send them to the bot in a private chat.
 - Native-flow menu with image header, quick replies and a WhatsApp Channel URL button. Native message rendering depends on WhatsApp client compatibility and must be verified with a linked account.
 - Developer contact buttons for Lord Voyage and Calvin The Great.
 
@@ -26,13 +26,15 @@ SOAM means monitoring the bot against spam, suspicious activity, account abuse a
 
 ## Local installation
 
-Requirements: Node.js 20 or newer, npm, and a WhatsApp account you own or are authorized to link.
+Requirements: Node.js 20.19 or newer (22 LTS recommended, same as the Docker image), npm, and a WhatsApp account you own or are authorized to link.
 
 1. Copy `.env.example` to `.env`.
 2. Set `OWNER_NUMBER` to the primary bot owner's WhatsApp number in international digits-only format. The website bootstrap pairing endpoint accepts only this number. Additional users must send `/pair` from their own private WhatsApp chat.
-4. Run `npm install`.
-5. Run `npm run check`.
-6. Run `npm start` and open `http://localhost:3000`.
+3. Run `npm ci`.
+4. Run `npm run check` (syntax) and `npm test` (server, database, pairing-authorization and command tests).
+5. Run `npm start` and open `http://localhost:3000`.
+
+All environment variables are documented in `.env.example`. Only `OWNER_NUMBER` needs a value; there is no admin token or activation key.
 
 SQLite is created at `DATA_DIR/whatsapp-protection.sqlite`; Baileys credentials are stored at `DATA_DIR/auth`. Never publish or commit this directory.
 
@@ -40,7 +42,7 @@ SQLite is created at `DATA_DIR/whatsapp-protection.sqlite`; Baileys credentials 
 
 1. Push the project to a private Git repository.
 2. Create a Render Blueprint using `render.yaml`, or create a Docker Web Service.
-3. Keep the persistent disk mounted at `/data` (the blueprint provisions a 1 GB disk).
+3. Keep the persistent disk mounted at `/data` (the blueprint provisions a 1 GB disk; Render disks need a paid instance type such as Starter). Render sets `PORT` itself; the server listens on it.
 4. Set `DATA_DIR=/data` and `OWNER_NUMBER` in the Render environment. The public pairing form only accepts the configured owner number; additional users must send /pair from their own private WhatsApp chat.
 5. Deploy and wait for `/api/health` to report `ok: true`.
 6. Open `/pair`, enter the configured owner number, and request the primary bot's pairing code. After the main bot is connected, each additional user sends `/pair` to the bot in a private chat.
@@ -61,15 +63,17 @@ The dashboard is read-only. There are no public administrator endpoints. Protect
 
 ## Limitations and safety
 
+- Pairing codes from `/pair` expire after 10 minutes; unfinished pairing sessions and their temporary auth files are removed automatically.
+- `MAX_LINKED_ACCOUNTS` (default 100, `0` = unlimited) only exists because every linked account is a separate live WhatsApp connection using server memory; raise it to match your instance size.
 - Pairing and real WhatsApp messaging require a live compatible WhatsApp account and network access; these cannot be fully tested without linking an account.
 - Native-flow button appearance and callbacks must be tested with the deployed Baileys version and current WhatsApp clients.
 - The bot does not scan the phone or uploaded files, detect all account compromise, reverse bans, or guarantee immunity from WhatsApp enforcement.
 - Only pair accounts you own or are authorized to administer. Do not use the bot for unsolicited bulk messaging, spam, harassment or platform-limit evasion.
-- WhatsApp Protection is an independent project and is not affiliated with WhatsApp or Meta. Each connected primary or additional account receives a WhatsApp Channel follow request after connection. A failed request is logged and is not represented as a successful follow.
+- WhatsApp Protection is an independent project and is not affiliated with WhatsApp or Meta. Each connected primary or additional account sends one WhatsApp Channel follow request after connection. Success is stored only after WhatsApp accepts the request (so it is not repeated); a failed request is logged and retried on the next connection.
 
 ## Verification
 
-Run `npm run check` for JavaScript syntax checks. A live pairing, outbound messaging and interactive-button test requires dependency installation, deployment and an authorized WhatsApp account.
+Run `npm run check` for JavaScript syntax checks and `npm test` for the automated suite (uses a temporary `DATA_DIR` and fake sockets; it never contacts WhatsApp). A live pairing, outbound messaging and interactive-button test requires dependency installation, deployment and an authorized WhatsApp account.
 
 ### Dashboard access
 The dashboard is intentionally read-only and does not require an administrator token. It shows only basic service health. Protection controls, security-event logs, and WhatsApp session files are not exposed publicly. Enable protections using WhatsApp commands from the configured owner or an active paired account.
