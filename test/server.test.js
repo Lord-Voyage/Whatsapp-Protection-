@@ -157,7 +157,10 @@ test('linked numbers manage their own settings; strangers are rejected and logge
   const before = sock.calls.sent.length;
   await handleCommand(dm(STRANGER, '/activate bug_protection'), sock);
   assert.equal(featureEnabled('bug_protection', STRANGER), false);
-  assert.equal(sock.calls.sent.length, before, 'no reply to unauthorized command');
+  assert.equal(sock.calls.sent.length, before + 1, 'unpaired users are told how to pair');
+  assert.match(lastText(sock), /not paired[\s\S]*\/pair/);
+  await handleCommand(dm(STRANGER, '/menu'), sock);
+  assert.equal(sock.calls.sent.length, before + 1, 'the notice is rate limited');
   assert.ok(db.prepare("SELECT 1 FROM security_events WHERE sender=? AND event='unauthorized_command_attempt'").get(STRANGER));
 });
 
@@ -185,7 +188,30 @@ test('SOAM cooldown blocks command floods without crashing', async () => {
   assert.ok(db.prepare("SELECT 1 FROM security_events WHERE sender=? AND event='command_abuse_cooldown'").get(LINKED));
 });
 
-test('interactive buttons are sent through baileys_helper with plain-text fallback', async () => {
+test('by default replies use standard messages: plain-text developers, image menu listing every documented command', async () => {
+  const sock = fakeSocket(); setPrimarySocket(sock);
+  await handleCommand(selfChat('/developers'), sock);
+  assert.equal(sock.calls.relayed.length, 0);
+  assert.match(lastText(sock), /wa\.me\/256702662846/);
+  await handleCommand(selfChat('/menu'), sock);
+  const menu = sock.calls.sent.at(-1).content;
+  assert.ok(Buffer.isBuffer(menu.image), 'menu keeps the logo image');
+  const html = fs.readFileSync(new URL('../public/docs/commands.html', import.meta.url), 'utf8');
+  const documented = [...html.matchAll(/<code>(\/[a-z_ ]+)<\/code>/g)].map(m => m[1].trim());
+  assert.ok(documented.length >= 10);
+  for (const command of documented) assert.ok(menu.caption.includes(command), `menu lists ${command}`);
+  assert.ok(menu.caption.includes(testing.CHANNEL_CODE));
+  for (const command of documented.filter(c => c !== '/pair')) {
+    const count = sock.calls.sent.length;
+    await handleCommand(selfChat(command), sock);
+    assert.equal(sock.calls.sent.length, count + 1, `${command} replies`);
+    assert.doesNotMatch(lastText(sock), /UNKNOWN COMMAND/, `${command} is handled`);
+  }
+});
+
+test('interactive buttons (INTERACTIVE_BUTTONS=true) are sent through baileys_helper with plain-text fallback', async () => {
+  process.env.INTERACTIVE_BUTTONS = 'true';
+  after(() => { delete process.env.INTERACTIVE_BUTTONS; });
   const sock = fakeSocket(); setPrimarySocket(sock);
   await handleCommand(selfChat('/developers'), sock);
   assert.equal(sock.calls.relayed.length, 1);
