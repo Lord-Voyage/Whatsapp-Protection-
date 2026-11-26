@@ -713,7 +713,6 @@ function endPrimaryPairing(activeSock, status, reason) {
 async function startSocket(phoneForPairing = null, requestCode = false) {
   if (sock || shuttingDown) throw new Error('A WhatsApp session is already active or starting.');
   manualDisconnect = false;
-  if (phoneForPairing) currentPhone = phoneForPairing;
   currentStatus = 'connecting';
   const { state, saveCreds } = await useMultiFileAuthState(AUTH_DIR);
   if (sock || shuttingDown) throw new Error('A WhatsApp session is already active or starting.');
@@ -722,6 +721,7 @@ async function startSocket(phoneForPairing = null, requestCode = false) {
   const activeSock = makeWASocket({ auth: state, ...(version ? { version } : {}), printQRInTerminal: false, logger: waLogger, browser: ['WhatsApp Protection', 'Chrome', '1.0.0'], markOnlineOnConnect: false, syncFullHistory: false });
   const pairingReady = requestCode && !state.creds.registered ? waitForPairingChallenge(activeSock) : null;
   sock = activeSock;
+  if (phoneForPairing) currentPhone = phoneForPairing;
   activeSock.ev.on('creds.update', saveCreds);
   activeSock.ev.on('connection.update', async update => {
     try {
@@ -870,19 +870,27 @@ function isPrimaryPairingRequest(phone) {
   if (currentPhone && phone === currentPhone) return true;
   return !sock && currentStatus !== 'connected' && !isRegisteredCredsFile(path.join(AUTH_DIR, 'creds.json')) && getLinkedDevice.get(phone)?.status !== 'active';
 }
+let primaryPairingStarting = false;
+let primaryPairingPhone = null;
 async function requestPrimaryPairing(phone, res) {
   const expiresInSeconds = PAIRING_TOKEN_TTL / 1000;
   if (currentStatus === 'connected') return res.status(409).json({ error: 'This number is already connected as the primary bot account.' });
+  if (primaryPairingStarting) return res.status(409).json({ error: 'The primary WhatsApp session is already connecting. Wait a moment and try again.' });
   if (sock) {
-    if (currentPhone === phone && primaryPairingToken && Date.now() < primaryPairingTokenExpires) return res.json({ status: currentStatus, pairingToken: primaryPairingToken, code: primaryPairingCode, expiresInSeconds });
+    if (primaryPairingPhone === phone && currentPhone === phone && primaryPairingToken && Date.now() < primaryPairingTokenExpires) return res.json({ status: currentStatus, pairingToken: primaryPairingToken, code: primaryPairingCode, expiresInSeconds });
     return res.status(409).json({ error: 'The primary WhatsApp session is already connecting. Wait a moment and try again.' });
   }
   if (isRegisteredCredsFile(path.join(AUTH_DIR, 'creds.json'))) return res.status(409).json({ error: 'The primary WhatsApp account is already registered. Restore its saved session or securely reset DATA_DIR/auth to pair again.' });
-  primaryPairingToken = crypto.randomBytes(24).toString('hex');
-  // The token outlives the code slightly so the page can still read the final status.
-  primaryPairingTokenExpires = Date.now() + PAIRING_TOKEN_TTL + 2 * 60_000;
-  primaryPairingCode = null;
-  const code = await startSocket(phone, true);
+  primaryPairingStarting = true;
+  let code;
+  try {
+    primaryPairingToken = crypto.randomBytes(24).toString('hex');
+    primaryPairingPhone = phone;
+    // The token outlives the code slightly so the page can still read the final status.
+    primaryPairingTokenExpires = Date.now() + PAIRING_TOKEN_TTL + 2 * 60_000;
+    primaryPairingCode = null;
+    code = await startSocket(phone, true);
+  } finally { primaryPairingStarting = false; }
   if (!code) return res.status(202).json({ status: currentStatus, pairingToken: primaryPairingToken, expiresInSeconds, message: 'Pairing started. Waiting for the code…' });
   res.json({ status: currentStatus, pairingToken: primaryPairingToken, code, expiresInSeconds });
 }
