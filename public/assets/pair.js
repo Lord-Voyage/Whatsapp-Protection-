@@ -38,7 +38,7 @@ function startPolling() {
       const result = await fetch(`/api/pair-code/status?token=${encodeURIComponent(pairingToken)}`, { cache: 'no-store' });
       const current = await readJson(result);
       if (!result.ok) throw new Error(current.error || 'Could not check pairing status.');
-      if (current.connected || current.status === 'connected') { stopPolling(); codeWrap.hidden = true; activeCode = ''; status('WhatsApp connected successfully.'); resetButton(); return; }
+      if (current.connected || current.status === 'connected') { stopPolling(); codeWrap.hidden = true; activeCode = ''; status('WhatsApp connected successfully. Send /menu in your WhatsApp “Message yourself” chat to use the bot.'); resetButton(); return; }
       if (current.code) showCode(current.code);
       if (FAILED_STATES[current.status] || attempts >= 480) { stopPolling(); codeWrap.hidden = true; activeCode = ''; status(FAILED_STATES[current.status] || 'Pairing did not complete. Check the service logs and try again.', true); resetButton('Try again ↗'); }
     } catch (error) { stopPolling(); status(error.message, true); resetButton('Try again ↗'); }

@@ -2,11 +2,12 @@ import express from 'express';
 import path from 'node:path';
 import fs from 'node:fs';
 import crypto from 'node:crypto';
+import { AsyncLocalStorage } from 'node:async_hooks';
 import { fileURLToPath } from 'node:url';
 import { createRequire } from 'node:module';
 import Database from 'better-sqlite3';
 import pino from 'pino';
-import makeWASocket, { useMultiFileAuthState, DisconnectReason, fetchLatestBaileysVersion, prepareWAMessageMedia } from '@whiskeysockets/baileys';
+import makeWASocket, { useMultiFileAuthState, DisconnectReason, Browsers, fetchLatestBaileysVersion, fetchLatestWaWebVersion, prepareWAMessageMedia } from '@whiskeysockets/baileys';
 
 const require = createRequire(import.meta.url);
 const { sendInteractiveMessage } = require('baileys_helper');
@@ -89,6 +90,7 @@ const incomingMessageActivity = new Map();
 const blockedSenders = new Map();
 const outboundQueues = new Map();
 const PAIRING_TOKEN_TTL = 10 * 60 * 1000;
+const PAIRING_QR_REF_MS = 2 * 60 * 1000;
 const LINKED_AUTH_DIR = path.join(AUTH_DIR, 'linked');
 const CHANNEL_CODE = '0029Vb84TTB1SWt2Fvyhtu2D';
 fs.mkdirSync(LINKED_AUTH_DIR, { recursive: true });
@@ -141,16 +143,42 @@ async function resolveWaVersion() {
   if (cachedWaVersion && Date.now() - cachedWaVersionAt < 6 * 60 * 60_000) return cachedWaVersion;
   try {
     const timeout = new Promise((_, reject) => setTimeout(() => reject(new Error('Timed out fetching WhatsApp Web version')), 10_000).unref());
-    const { version } = await Promise.race([fetchLatestBaileysVersion(), timeout]);
-    if (Array.isArray(version)) { cachedWaVersion = version; cachedWaVersionAt = Date.now(); }
+    // WhatsApp rejects device links from stale web versions, so prefer the live web.whatsapp.com version.
+    for (const fetchVersion of [fetchLatestWaWebVersion, fetchLatestBaileysVersion]) {
+      const { version, isLatest } = await Promise.race([fetchVersion(), timeout]);
+      if (isLatest && Array.isArray(version)) { cachedWaVersion = version; cachedWaVersionAt = Date.now(); break; }
+    }
   } catch (error) { log.warn({ err: error }, 'Could not fetch latest WhatsApp Web version; using library default'); }
   return cachedWaVersion;
 }
 
+// Socket options shared by the primary and linked sessions. Baileys only emits pairing-code
+// "qr" refs for a few minutes by default and then closes the socket, which makes WhatsApp
+// answer "Couldn't link device" if the code is entered late; keep the socket alive for the
+// whole pairing window instead. A standard browser identity is required for code linking.
+function waSocketOptions(auth, version) {
+  return {
+    auth, ...(version ? { version } : {}), logger: waLogger, printQRInTerminal: false,
+    browser: Browsers.macOS('Chrome'), qrTimeout: PAIRING_QR_REF_MS,
+    markOnlineOnConnect: false, syncFullHistory: false
+  };
+}
+
+// Replies go out through the socket that received the command: the primary bot, or a linked
+// user's own session when they command it from their "Message yourself" chat.
+const replyContext = new AsyncLocalStorage();
+function replySocket() {
+  const ctx = replyContext.getStore();
+  if (ctx) return ctx.isOpen() ? ctx.socket : null;
+  return sock && currentStatus === 'connected' ? sock : null;
+}
+
 // Outbound anti-spam guard: serializes replies and caps message bursts per destination.
 async function sendBotPayload(jid, sendFn, phone = getOwnerPhone()) {
-  if (!sock || currentStatus !== 'connected') return false;
-  if (!featureEnabled('ban_protection', phone)) return sendFn(sock);
+  const ctx = replyContext.getStore();
+  const currentSocket = () => (ctx ? (ctx.isOpen() ? ctx.socket : null) : replySocket());
+  if (!currentSocket()) return false;
+  if (!featureEnabled('ban_protection', phone)) return sendFn(currentSocket());
   const now = Date.now();
   let state = outboundQueues.get(jid);
   if (!state) state = { chain: Promise.resolve(), sent: [], queued: 0, lastSent: 0 };
@@ -162,8 +190,7 @@ async function sendBotPayload(jid, sendFn, phone = getOwnerPhone()) {
   }
   state.queued += 1;
   const task = state.chain.then(async () => {
-    const activeSock = sock;
-    if (!activeSock || currentStatus !== 'connected') return false;
+    if (!currentSocket()) return false;
     const t = Date.now();
     state.sent = state.sent.filter(stamp => t - stamp < 60_000);
     if (state.sent.length >= 8) {
@@ -174,8 +201,9 @@ async function sendBotPayload(jid, sendFn, phone = getOwnerPhone()) {
     }
     const spacing = Math.max(0, 1800 - (Date.now() - state.lastSent));
     if (spacing) await sleep(spacing);
-    if (!sock || currentStatus !== 'connected') return false;
-    const result = await sendFn(sock);
+    const activeSock = currentSocket();
+    if (!activeSock) return false;
+    const result = await sendFn(activeSock);
     state.lastSent = Date.now();
     state.sent.push(state.lastSent);
     return result ?? true;
@@ -189,7 +217,7 @@ async function sendText(jid, text) {
   return sendBotPayload(jid, activeSock => activeSock.sendMessage(jid, { text }));
 }
 async function sendBrandedText(jid, title, body, buttons = [], phone = getOwnerPhone()) {
-  if (!sock || currentStatus !== 'connected') return;
+  if (!replySocket()) return;
   const nativeButtons = buttons.map(button => ({
     name: button.url ? 'cta_url' : 'quick_reply',
     buttonParamsJson: JSON.stringify(button.url ? { display_text: button.label, url: button.url } : { display_text: button.label, id: button.id })
@@ -213,7 +241,7 @@ async function sendBrandedText(jid, title, body, buttons = [], phone = getOwnerP
 }
 
 async function sendMenu(jid, phone) {
-  if (!sock || currentStatus !== 'connected') return;
+  if (!replySocket()) return;
   const caption = [
     '*WHATSAPP PROTECTION*',
     '',
@@ -419,15 +447,22 @@ async function startLinkedSessionInternal(phone, { requestCode = false } = {}) {
     code: null, codeExpiresAt: 0, reconnectTimer: null, expiryTimer: null,
     reconnectAttempt: existing?.reconnectAttempt || 0, intentionalClose: false
   };
-  const activeSock = makeWASocket({
-    auth: state, ...(version ? { version } : {}), printQRInTerminal: false,
-    logger: waLogger, browser: ['WhatsApp Protection', 'Chrome', '1.0.0'],
-    markOnlineOnConnect: false, syncFullHistory: false
-  });
+  const activeSock = makeWASocket(waSocketOptions(state, version));
   const pairingReady = requestCode && !state.creds.registered ? waitForPairingChallenge(activeSock) : null;
   record.socket = activeSock;
   linkedSessions.set(phone, record);
   activeSock.ev.on('creds.update', saveCreds);
+  // A linked user runs the bot on their own account: only their own messages in their
+  // "Message yourself" chat are commands; messages other people send them are ignored.
+  const linkedReplyContext = { socket: activeSock, isOpen: () => record.socket === activeSock && record.status === 'connected' };
+  activeSock.ev.on('messages.upsert', async ({ messages, type }) => {
+    if (type !== 'notify') return;
+    for (const msg of messages || []) {
+      if (!msg?.key?.fromMe) continue;
+      try { await replyContext.run(linkedReplyContext, () => handleCommand(msg, activeSock)); }
+      catch (error) { safeLogError(error, 'Linked command handler failed', phone); }
+    }
+  });
   activeSock.ev.on('connection.update', async update => {
     try {
       const { connection, lastDisconnect } = update;
@@ -630,9 +665,9 @@ async function handleCommand(msg, activeSock = sock) {
           '```' + result.code + '```',
           '',
           'On the same phone number, open WhatsApp → Linked devices → Link a device → Link with phone number, then enter this code.',
-          'Keep this code private. It expires shortly.',
+          'Keep this code private. It is valid for 10 minutes.',
           '',
-          'After the account connects, it will be authorized to use the bot and the channel-follow request will run.'
+          'After the account connects, send /menu in your own "Message yourself" chat to use the bot.'
         ].join('\n');
         await sendBotPayload(jid, activeSock => activeSock.sendMessage(jid, { text: reply }), sender);
       } else {
@@ -720,7 +755,7 @@ async function startSocket(phoneForPairing = null, requestCode = false) {
   if (sock || shuttingDown) throw new Error('A WhatsApp session is already active or starting.');
   const version = await resolveWaVersion();
   if (sock || shuttingDown) throw new Error('A WhatsApp session is already active or starting.');
-  const activeSock = makeWASocket({ auth: state, ...(version ? { version } : {}), printQRInTerminal: false, logger: waLogger, browser: ['WhatsApp Protection', 'Chrome', '1.0.0'], markOnlineOnConnect: false, syncFullHistory: false });
+  const activeSock = makeWASocket(waSocketOptions(state, version));
   const pairingReady = requestCode && !state.creds.registered ? waitForPairingChallenge(activeSock) : null;
   sock = activeSock;
   if (phoneForPairing) currentPhone = phoneForPairing;
@@ -993,7 +1028,7 @@ if (isMainModule) start();
 
 // Internal hooks used by the automated test suite (test/). Not part of the public HTTP API.
 export const testing = {
-  app, db, handleCommand, waitForPairingChallenge, linkedSessions, linkedPairingState, issueLinkedPairingToken, isPrimaryPairingRequest, resolveCommandSender, followChannelForPrimaryAccount, followChannelForLinkedAccount, featureEnabled,
+  app, db, handleCommand, waitForPairingChallenge, replyContext, waSocketOptions, PAIRING_QR_REF_MS, linkedSessions, linkedPairingState, issueLinkedPairingToken, isPrimaryPairingRequest, resolveCommandSender, followChannelForPrimaryAccount, followChannelForLinkedAccount, featureEnabled,
   setPrimarySocket(activeSock, status = 'connected') { sock = activeSock; currentStatus = status; if (activeSock?.user?.id) currentPhone = phoneFromJid(activeSock.user.id); },
   CHANNEL_CODE
 };
