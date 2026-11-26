@@ -16,21 +16,22 @@ const { testing } = await import('../server.js');
 const { app, db, handleCommand, followChannelForPrimaryAccount, followChannelForLinkedAccount, featureEnabled, setPrimarySocket } = testing;
 let server; let base;
 
-function fakeSocket({ followError } = {}) {
-  const calls = { sent: [], relayed: [], metadata: 0, follow: 0 };
+function fakeSocket({ followError, user = { id: `${OWNER}:7@s.whatsapp.net`, lid: '99887766:7@lid' } } = {}) {
+  const calls = { sent: [], relayed: [], all: [], follow: 0, followed: [] };
   return {
     calls,
-    user: { id: `${OWNER}:7@s.whatsapp.net`, lid: '99887766:7@lid' },
-    authState: { creds: { me: { id: `${OWNER}:7@s.whatsapp.net` } } },
-    sendMessage: async (jid, content) => { calls.sent.push({ jid, content }); return { key: { id: 'x' } }; },
-    relayMessage: async (jid, message, opts) => { calls.relayed.push({ jid, message, opts }); },
-    newsletterMetadata: async (type, key) => { calls.metadata += 1; assert.equal(type, 'invite'); assert.equal(key, testing.CHANNEL_CODE); return { id: '120363000000000000@newsletter' }; },
-    newsletterFollow: async () => { calls.follow += 1; if (followError) throw followError; return { ok: true }; }
+    user,
+    authState: { creds: { me: { id: user.id } } },
+    sendMessage: async (jid, content) => { const entry = { jid, content }; calls.sent.push(entry); calls.all.push(entry); return { key: { id: 'x' } }; },
+    relayMessage: async (jid, message, opts) => { const entry = { jid, message, opts }; calls.relayed.push(entry); calls.all.push(entry); },
+    waUploadToServer: async () => ({ mediaUrl: 'https://mmg.whatsapp.net/test', directPath: '/test' }),
+    newsletterFollow: async jid => { calls.follow += 1; calls.followed.push(jid); if (followError) throw followError; return { ok: true }; }
   };
 }
+const interactiveOf = entry => entry?.message?.interactiveMessage || entry?.message?.viewOnceMessage?.message?.interactiveMessage || null;
 const dm = (from, text, extra = {}) => ({ key: { remoteJid: `${from}@s.whatsapp.net`, fromMe: false, id: String(Math.random()), ...extra }, message: { conversation: text } });
 const selfChat = text => ({ key: { remoteJid: `${OWNER}@s.whatsapp.net`, fromMe: true, id: String(Math.random()) }, message: { conversation: text } });
-const lastText = sock => { const m = sock.calls.sent.at(-1); return m?.content?.text || ''; };
+const lastText = sock => { const m = sock.calls.all.at(-1); return m?.content?.text || m?.content?.caption || interactiveOf(m)?.body?.text || ''; };
 
 before(async () => {
   await new Promise(resolve => { server = app.listen(0, '127.0.0.1', resolve); });
@@ -141,11 +142,22 @@ test('owner commands from the self chat update only the owner settings', async (
   assert.equal(featureEnabled('ban_protection', OWNER), false);
 });
 
-test('outgoing messages to other chats are never treated as owner commands', async () => {
+test('owners run commands in any chat or group and the reply goes to that chat', async () => {
   const sock = fakeSocket(); setPrimarySocket(sock);
-  await handleCommand({ key: { remoteJid: `${STRANGER}@s.whatsapp.net`, fromMe: true, id: 'a' }, message: { conversation: '/activate bug_protection' } }, sock);
-  assert.equal(featureEnabled('bug_protection', OWNER), false);
-  assert.equal(sock.calls.sent.length, 0);
+  const other = `${STRANGER}@s.whatsapp.net`;
+  await handleCommand({ key: { remoteJid: other, fromMe: true, id: 'a' }, message: { conversation: '/status' } }, sock);
+  assert.equal(sock.calls.all.at(-1).jid, other);
+  assert.match(lastText(sock), /PROTECTION STATUS[\s\S]*primary owner/);
+  const group = '1203630000@g.us';
+  await handleCommand({ key: { remoteJid: group, participant: `${OWNER}@s.whatsapp.net`, fromMe: true, id: 'g1' }, message: { conversation: '/menu' } }, sock);
+  assert.equal(sock.calls.all.at(-1).jid, group);
+  const before = sock.calls.all.length;
+  await handleCommand({ key: { remoteJid: other, fromMe: true, id: 'b' }, message: { conversation: 'hello' } }, sock);
+  await handleCommand({ key: { remoteJid: other, fromMe: true, id: 'c' }, message: { conversation: '/shrug' } }, sock);
+  assert.equal(sock.calls.all.length, before, 'ordinary text and unknown slash text in other chats get no reply');
+  await handleCommand({ key: { remoteJid: group, participant: `${STRANGER}@s.whatsapp.net`, fromMe: false, id: 'g2' }, message: { conversation: '/activate bug_protection' } }, sock);
+  assert.equal(featureEnabled('bug_protection', STRANGER), false);
+  assert.equal(sock.calls.all.length, before, 'unpaired group members get no reply');
 });
 
 test('linked numbers manage their own settings; strangers are rejected and logged', async () => {
@@ -154,13 +166,13 @@ test('linked numbers manage their own settings; strangers are rejected and logge
   assert.equal(featureEnabled('soam_protection', LINKED), true);
   assert.equal(featureEnabled('soam_protection', OWNER), false);
 
-  const before = sock.calls.sent.length;
+  const before = sock.calls.all.length;
   await handleCommand(dm(STRANGER, '/activate bug_protection'), sock);
   assert.equal(featureEnabled('bug_protection', STRANGER), false);
-  assert.equal(sock.calls.sent.length, before + 1, 'unpaired users are told how to pair');
+  assert.equal(sock.calls.all.length, before + 1, 'unpaired users are told how to pair');
   assert.match(lastText(sock), /not paired[\s\S]*\/pair/);
   await handleCommand(dm(STRANGER, '/menu'), sock);
-  assert.equal(sock.calls.sent.length, before + 1, 'the notice is rate limited');
+  assert.equal(sock.calls.all.length, before + 1, 'the notice is rate limited');
   assert.ok(db.prepare("SELECT 1 FROM security_events WHERE sender=? AND event='unauthorized_command_attempt'").get(STRANGER));
 });
 
@@ -188,30 +200,53 @@ test('SOAM cooldown blocks command floods without crashing', async () => {
   assert.ok(db.prepare("SELECT 1 FROM security_events WHERE sender=? AND event='command_abuse_cooldown'").get(LINKED));
 });
 
-test('by default replies use standard messages: plain-text developers, image menu listing every documented command', async () => {
+test('menu and every command reply carry buttons and the channel banner; the menu lists every documented command', async () => {
   const sock = fakeSocket(); setPrimarySocket(sock);
-  await handleCommand(selfChat('/developers'), sock);
-  assert.equal(sock.calls.relayed.length, 0);
-  assert.match(lastText(sock), /wa\.me\/256702662846/);
   await handleCommand(selfChat('/menu'), sock);
-  const menu = sock.calls.sent.at(-1).content;
-  assert.ok(Buffer.isBuffer(menu.image), 'menu keeps the logo image');
+  const menu = interactiveOf(sock.calls.all.at(-1));
+  assert.ok(menu, 'menu is a button message');
+  assert.ok(menu.header?.imageMessage, 'menu keeps the logo image');
+  assert.equal(menu.contextInfo.forwardedNewsletterMessageInfo.newsletterJid, '120363409908822540@newsletter');
+  assert.equal(menu.contextInfo.isForwarded, true);
+  const menuButtons = menu.nativeFlowMessage.buttons.map(b => JSON.parse(b.buttonParamsJson));
+  assert.ok(menuButtons.some(b => b.url === testing.CHANNEL_URL), 'menu has the channel button');
   const html = fs.readFileSync(new URL('../public/docs/commands.html', import.meta.url), 'utf8');
   const documented = [...html.matchAll(/<code>(\/[a-z_ ]+)<\/code>/g)].map(m => m[1].trim());
   assert.ok(documented.length >= 10);
-  for (const command of documented) assert.ok(menu.caption.includes(command), `menu lists ${command}`);
-  assert.ok(menu.caption.includes(testing.CHANNEL_CODE));
+  for (const command of documented) assert.ok(menu.body.text.includes(command), `menu lists ${command}`);
   for (const command of documented.filter(c => c !== '/pair')) {
-    const count = sock.calls.sent.length;
+    const count = sock.calls.all.length;
     await handleCommand(selfChat(command), sock);
-    assert.equal(sock.calls.sent.length, count + 1, `${command} replies`);
+    assert.equal(sock.calls.all.length, count + 1, `${command} replies`);
+    const reply = interactiveOf(sock.calls.all.at(-1));
+    assert.ok(reply?.nativeFlowMessage?.buttons?.length >= 3, `${command} reply has buttons`);
+    assert.equal(reply.contextInfo.forwardedNewsletterMessageInfo.newsletterJid, testing.CHANNEL_JID);
     assert.doesNotMatch(lastText(sock), /UNKNOWN COMMAND/, `${command} is handled`);
   }
+  const statusButton = menuButtons.find(b => b.id === '/status');
+  const count = sock.calls.all.length;
+  await handleCommand({ key: { remoteJid: `${OWNER}@s.whatsapp.net`, fromMe: true, id: 'btn' }, message: { interactiveResponseMessage: { nativeFlowResponseMessage: { paramsJson: JSON.stringify({ id: statusButton.id }) } } } }, sock);
+  assert.equal(sock.calls.all.length, count + 1);
+  assert.match(lastText(sock), /PROTECTION STATUS/, 'tapping a button runs its command');
 });
 
-test('interactive buttons (INTERACTIVE_BUTTONS=true) are sent through baileys_helper with plain-text fallback', async () => {
-  process.env.INTERACTIVE_BUTTONS = 'true';
-  after(() => { delete process.env.INTERACTIVE_BUTTONS; });
+test('INTERACTIVE_BUTTONS=false sends standard messages that still carry the channel banner', async () => {
+  process.env.INTERACTIVE_BUTTONS = 'false';
+  try {
+    const sock = fakeSocket(); setPrimarySocket(sock);
+    await handleCommand(selfChat('/menu'), sock);
+    const menu = sock.calls.all.at(-1).content;
+    assert.ok(Buffer.isBuffer(menu.image));
+    assert.match(menu.caption, /\/deactivate soam_protection[\s\S]*whatsapp\.com\/channel/);
+    assert.equal(menu.contextInfo.forwardedNewsletterMessageInfo.newsletterJid, testing.CHANNEL_JID);
+    assert.equal(menu.contextInfo.externalAdReply.sourceUrl, testing.CHANNEL_URL);
+    await handleCommand(selfChat('/developers'), sock);
+    assert.match(lastText(sock), /wa\.me\/256702662846/);
+    assert.equal(sock.calls.relayed.length, 0);
+  } finally { delete process.env.INTERACTIVE_BUTTONS; }
+});
+
+test('button messages are sent through baileys_helper with a standard fallback', async () => {
   const sock = fakeSocket(); setPrimarySocket(sock);
   await handleCommand(selfChat('/developers'), sock);
   assert.equal(sock.calls.relayed.length, 1);
@@ -245,22 +280,20 @@ test('pairing status polling is not throttled by the code-request limit', async 
   assert.ok(limited, 'code requests are still rate limited');
 });
 
-test('linked users command the bot from their own "Message yourself" chat and get replies on their own session', async () => {
+test('linked users command the bot from their own account and get replies on their own session', async () => {
   const USER = '256700000044';
   db.prepare("INSERT INTO linked_devices(phone,status,session_status) VALUES(?,?,?)").run(USER, 'active', 'connected');
   const primary = fakeSocket(); setPrimarySocket(primary);
-  const linkedSock = { ...fakeSocket(), user: { id: `${USER}:3@s.whatsapp.net`, lid: '11223344:3@lid' } };
-  linkedSock.calls = { sent: [] };
-  linkedSock.sendMessage = async (jid, content) => { linkedSock.calls.sent.push({ jid, content }); return { key: { id: 'y' } }; };
+  const linkedSock = fakeSocket({ user: { id: `${USER}:3@s.whatsapp.net`, lid: '11223344:3@lid' } });
   const ctx = { socket: linkedSock, isOpen: () => true };
   const own = { key: { remoteJid: `${USER}@s.whatsapp.net`, fromMe: true, id: 'own1' }, message: { conversation: '/status' } };
   await testing.replyContext.run(ctx, () => testing.handleCommand(own, linkedSock));
   assert.match(lastText(linkedSock), /PROTECTION STATUS[\s\S]*linked/);
-  assert.equal(primary.calls.sent.length, 0, 'the reply is not sent from the primary bot');
-  const before = linkedSock.calls.sent.length;
+  assert.equal(primary.calls.all.length, 0, 'the reply is not sent from the primary bot');
+  const before = linkedSock.calls.all.length;
   ctx.isOpen = () => false;
   await testing.replyContext.run(ctx, () => testing.handleCommand({ ...own, key: { ...own.key, id: 'own2' } }, linkedSock));
-  assert.equal(linkedSock.calls.sent.length, before, 'nothing is sent through a closed linked session');
+  assert.equal(linkedSock.calls.all.length, before, 'nothing is sent through a closed linked session');
 });
 
 test('sessions use a standard browser identity and stay open for the whole pairing window', () => {

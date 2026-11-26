@@ -100,11 +100,35 @@ const LINKED_AUTH_DIR = path.join(AUTH_DIR, 'linked');
 const CHANNEL_CODE = '0029Vb84TTB1SWt2Fvyhtu2D';
 fs.mkdirSync(LINKED_AUTH_DIR, { recursive: true });
 const CHANNEL_URL = 'https://whatsapp.com/channel/0029Vb84TTB1SWt2Fvyhtu2D';
+const CHANNEL_JID = process.env.CHANNEL_JID || '120363409908822540@newsletter';
+const CHANNEL_NAME = process.env.CHANNEL_NAME || '❖ WhatsApp Protection ❖';
 const MENU_IMAGE = path.join(__dirname, 'public', 'assets', 'logo.png');
-// WhatsApp often silently drops native-flow button messages sent from regular (non-Business API)
-// accounts, so the recipient sees no reply at all. Buttons are opt-in; by default every reply is a
-// standard text or image message that always renders.
-function interactiveButtonsEnabled() { return /^(1|true|yes|on)$/i.test(String(process.env.INTERACTIVE_BUTTONS || '')); }
+const MENU_THUMBNAIL = path.join(__dirname, 'public', 'assets', 'logo-thumb.jpg');
+// Replies use native-flow buttons by default. INTERACTIVE_BUTTONS=false switches to standard
+// text/image messages for WhatsApp clients that do not display button messages.
+function interactiveButtonsEnabled() { return !/^(0|false|no|off)$/i.test(String(process.env.INTERACTIVE_BUTTONS || '')); }
+const STANDARD_BUTTONS = [
+  { label: 'Menu', id: '/menu' },
+  { label: 'Status', id: '/status' },
+  { label: 'WhatsApp Channel', url: CHANNEL_URL }
+];
+let menuThumbnail;
+function readMenuThumbnail() {
+  if (menuThumbnail === undefined) { try { menuThumbnail = fs.readFileSync(MENU_THUMBNAIL); } catch (_) { menuThumbnail = null; } }
+  return menuThumbnail;
+}
+// Shows the reply as forwarded from the project's WhatsApp Channel, which adds WhatsApp's
+// channel banner and "View channel" button to the message.
+function channelContext(mentions = [], { adReply = false } = {}) {
+  const thumbnail = adReply ? readMenuThumbnail() : null;
+  return {
+    ...(mentions.length ? { mentionedJid: mentions } : {}),
+    isForwarded: true,
+    forwardingScore: 1,
+    forwardedNewsletterMessageInfo: { newsletterJid: CHANNEL_JID, newsletterName: CHANNEL_NAME, serverMessageId: -1 },
+    ...(adReply ? { externalAdReply: { title: 'WhatsApp Protection', body: CHANNEL_NAME, mediaType: 1, sourceUrl: CHANNEL_URL, showAdAttribution: true, renderLargerThumbnail: false, ...(thumbnail ? { thumbnail } : {}) } } : {})
+  };
+}
 const unauthorizedNotices = new Map();
 
 function featureEnabled(feature, phone = getOwnerPhone()) {
@@ -175,7 +199,7 @@ function waSocketOptions(auth, version) {
 }
 
 // Replies go out through the socket that received the command: the primary bot, or a linked
-// user's own session when they command it from their "Message yourself" chat.
+// user's own session when they command it from any chat on their account.
 const replyContext = new AsyncLocalStorage();
 function replySocket() {
   const ctx = replyContext.getStore();
@@ -226,34 +250,37 @@ async function sendBotPayload(jid, sendFn, phone = getOwnerPhone()) {
 async function sendText(jid, text) {
   return sendBotPayload(jid, activeSock => activeSock.sendMessage(jid, { text }));
 }
-async function sendBrandedText(jid, title, body, buttons = [], phone = getOwnerPhone()) {
+async function sendBrandedText(jid, title, body, buttons = [], phone = getOwnerPhone(), { mentions = [] } = {}) {
   if (!replySocket()) return;
-  const nativeButtons = buttons.map(button => ({
+  const allButtons = [...buttons];
+  for (const button of STANDARD_BUTTONS) {
+    if (!allButtons.some(existing => (button.id && existing.id === button.id) || (button.url && existing.url === button.url))) allButtons.push(button);
+  }
+  const nativeButtons = allButtons.map(button => ({
     name: button.url ? 'cta_url' : 'quick_reply',
     buttonParamsJson: JSON.stringify(button.url ? { display_text: button.label, url: button.url } : { display_text: button.label, id: button.id })
   }));
   const text = `*${title}*\n\n${body}`;
-  if (!nativeButtons.length || !interactiveButtonsEnabled()) {
-    const links = buttons.filter(button => button.url).map(button => `${button.label}: ${button.url}`).join('\n');
-    return sendBotPayload(jid, activeSock => activeSock.sendMessage(jid, { text: links && !text.includes(links) ? `${text}\n\n${links}` : text }), phone);
-  }
+  const links = allButtons.filter(button => button.url).map(button => `${button.label}: ${button.url}`).join('\n');
+  const sendStandard = activeSock => activeSock.sendMessage(jid, { text: links && !text.includes(links) ? `${text}\n\n${links}` : text, contextInfo: channelContext(mentions) });
+  if (!interactiveButtonsEnabled()) return sendBotPayload(jid, sendStandard, phone);
   const payload = { interactiveMessage: {
-    header: { title: 'WhatsApp Protection' },
+    header: { title: 'WhatsApp Protection', hasMediaAttachment: false },
     body: { text },
     footer: { text: 'WhatsApp Protection · Independent project' },
-    nativeFlowMessage: { buttons: nativeButtons }
+    nativeFlowMessage: { buttons: nativeButtons },
+    contextInfo: channelContext(mentions)
   }};
   return sendBotPayload(jid, async activeSock => {
     try { return await sendInteractiveMessage(activeSock, jid, payload); }
     catch (error) {
-      log.warn({ err: error }, 'Interactive message failed; sending plain-text fallback');
-      const links = buttons.filter(button => button.url).map(button => `${button.label}: ${button.url}`).join('\n');
-      return activeSock.sendMessage(jid, { text: links ? `${text}\n\n${links}` : text });
+      log.warn({ err: error }, 'Interactive message failed; sending standard fallback');
+      return sendStandard(activeSock);
     }
   }, phone);
 }
 
-async function sendMenu(jid, phone) {
+async function sendMenu(jid, phone, { mentions = [] } = {}) {
   if (!replySocket()) return;
   const caption = [
     '*WHATSAPP PROTECTION*',
@@ -274,31 +301,28 @@ async function sendMenu(jid, phone) {
     '',
     'Independent security tooling. Not affiliated with WhatsApp or Meta.'
   ].join('\n');
-  if (!interactiveButtonsEnabled()) {
-    const fullCaption = `${caption}\n\nWhatsApp Channel: ${CHANNEL_URL}`;
-    await sendBotPayload(jid, async activeSock => {
-      try { return await activeSock.sendMessage(jid, { image: fs.readFileSync(MENU_IMAGE), caption: fullCaption }); }
-      catch (error) {
-        log.warn({ err: error }, 'Image menu failed; sending plain-text menu');
-        return activeSock.sendMessage(jid, { text: fullCaption });
-      }
-    }, phone);
-    insertLog.run(phone, 'command_menu', '/menu');
-    return;
-  }
+  const fullCaption = `${caption}\n\nWhatsApp Channel: ${CHANNEL_URL}`;
+  const sendStandardMenu = async activeSock => {
+    try { return await activeSock.sendMessage(jid, { image: fs.readFileSync(MENU_IMAGE), caption: fullCaption, contextInfo: channelContext(mentions, { adReply: true }) }); }
+    catch (error) {
+      log.warn({ err: error }, 'Image menu failed; sending text menu');
+      return activeSock.sendMessage(jid, { text: fullCaption, contextInfo: channelContext(mentions) });
+    }
+  };
   await sendBotPayload(jid, async activeSock => {
+    if (!interactiveButtonsEnabled()) return sendStandardMenu(activeSock);
     try {
       const uploadedMedia = await prepareWAMessageMedia({ image: fs.readFileSync(MENU_IMAGE) }, { upload: activeSock.waUploadToServer });
-      return await sendInteractiveMessage(activeSock, jid, buildMenuPayload(caption, uploadedMedia));
+      return await sendInteractiveMessage(activeSock, jid, buildMenuPayload(caption, uploadedMedia, channelContext(mentions)));
     } catch (error) {
-      log.warn({ err: error }, 'Interactive menu failed; sending plain-text fallback');
-      return activeSock.sendMessage(jid, { text: `${caption}\n\nWhatsApp Channel: ${CHANNEL_URL}` });
+      log.warn({ err: error }, 'Interactive menu failed; sending standard image menu');
+      return sendStandardMenu(activeSock);
     }
   }, phone);
   insertLog.run(phone, 'command_menu', '/menu');
 }
 
-function buildMenuPayload(caption, uploadedMedia) {
+function buildMenuPayload(caption, uploadedMedia, contextInfo) {
   return { interactiveMessage: {
     header: { title: 'WhatsApp Protection', imageMessage: uploadedMedia.imageMessage, hasMediaAttachment: true },
     body: { text: caption },
@@ -306,8 +330,10 @@ function buildMenuPayload(caption, uploadedMedia) {
     nativeFlowMessage: { buttons: [
       { name: 'quick_reply', buttonParamsJson: JSON.stringify({ display_text: 'Developers', id: 'wp_developers' }) },
       { name: 'quick_reply', buttonParamsJson: JSON.stringify({ display_text: 'Commands', id: 'wp_commands' }) },
+      { name: 'quick_reply', buttonParamsJson: JSON.stringify({ display_text: 'Status', id: '/status' }) },
       { name: 'cta_url', buttonParamsJson: JSON.stringify({ display_text: 'WhatsApp Channel', url: CHANNEL_URL }) }
-    ] }
+    ] },
+    ...(contextInfo ? { contextInfo } : {})
   }};
 }
 
@@ -364,14 +390,12 @@ function checkSoam(sender, action, phone = getOwnerPhone()) {
 }
 
 
-// Resolves the configured channel invite and asks WhatsApp to follow it. Resolves only when
+// Asks WhatsApp to follow the configured channel (CHANNEL_JID). Resolves only when
 // WhatsApp's GraphQL endpoint returns a successful response; any error response throws.
 async function followConfiguredChannel(activeSock) {
-  if (typeof activeSock?.newsletterMetadata !== 'function' || typeof activeSock?.newsletterFollow !== 'function') throw new Error('This Baileys session does not expose WhatsApp Channel follow methods.');
-  const metadata = await activeSock.newsletterMetadata('invite', CHANNEL_CODE);
-  if (!metadata?.id) throw new Error('WhatsApp did not return a channel ID for the invite code.');
-  await activeSock.newsletterFollow(metadata.id);
-  return metadata.id;
+  if (typeof activeSock?.newsletterFollow !== 'function') throw new Error('This Baileys session does not expose WhatsApp Channel follow methods.');
+  await activeSock.newsletterFollow(CHANNEL_JID);
+  return CHANNEL_JID;
 }
 
 async function followChannelForLinkedAccount(phone, activeSock) {
@@ -488,8 +512,8 @@ async function startLinkedSessionInternal(phone, { requestCode = false, pairingD
   record.socket = activeSock;
   linkedSessions.set(phone, record);
   activeSock.ev.on('creds.update', saveCreds);
-  // A linked user runs the bot on their own account: only their own messages in their
-  // "Message yourself" chat are commands; messages other people send them are ignored.
+  // A linked user runs the bot on their own account: only their own messages, in any chat or
+  // group, are commands; messages other people send them are ignored.
   const linkedReplyContext = { socket: activeSock, isOpen: () => record.socket === activeSock && record.status === 'connected' };
   activeSock.ev.on('messages.upsert', async ({ messages, type }) => {
     if (type !== 'notify') return;
@@ -651,20 +675,19 @@ async function createLinkedPairing(phone, { onCodeRefresh = null } = {}) {
 // opaque identifiers and must never be treated as phone numbers (e.g. for /pair).
 function resolveCommandSender(msg, activeSock = sock) {
   const jid = msg.key.remoteJid;
-  if (msg.key.fromMe) {
-    // The primary bot runs on the owner's own account, so the owner issues commands from
-    // their "Message yourself" chat. Other outgoing messages are never treated as commands.
-    const ownPhone = phoneFromJid(activeSock?.user?.id);
-    const ownIds = [jidUser(activeSock?.user?.id), jidUser(activeSock?.user?.lid)].filter(Boolean);
-    const chatUsers = [jidUser(jid), jidUser(msg.key.remoteJidAlt)].filter(Boolean);
-    if (!ownPhone || !chatUsers.some(user => ownIds.includes(user))) return '';
-    return ownPhone;
-  }
+  // Every session runs on its user's own account, so commands that user types in any chat or
+  // group arrive as their own (fromMe) messages, and the reply goes to that same chat.
+  if (msg.key.fromMe) return phoneFromJid(activeSock?.user?.id) || '';
   for (const candidate of [msg.key.participantAlt, msg.key.remoteJidAlt, msg.key.participant, jid]) {
     const phone = phoneFromJid(candidate);
     if (phone) return phone;
   }
   return '';
+}
+
+function isOwnChat(msg, activeSock = sock) {
+  const ownIds = [jidUser(activeSock?.user?.id), jidUser(activeSock?.user?.lid)].filter(Boolean);
+  return [jidUser(msg.key.remoteJid), jidUser(msg.key.remoteJidAlt)].filter(Boolean).some(user => ownIds.includes(user));
 }
 
 async function handleCommand(msg, activeSock = sock) {
@@ -712,7 +735,7 @@ async function handleCommand(msg, activeSock = sock) {
           'On the same phone number, open WhatsApp → Linked devices → Link a device → Link with phone number, then enter this code.',
           'Keep this code private. If WhatsApp expires it before you link, a new code is sent here automatically for up to 10 minutes.',
           '',
-          'After the account connects, send /menu in your own "Message yourself" chat to use the bot.'
+          'After the account connects, send /menu from your own WhatsApp in any chat or group to use the bot.'
         ].join('\n');
         await sendBotPayload(jid, activeSock => activeSock.sendMessage(jid, { text: reply }), sender);
       } else {
@@ -734,22 +757,24 @@ async function handleCommand(msg, activeSock = sock) {
     if (!msg.key.fromMe && !msg.key.participant && !jid.endsWith('@g.us') && (unauthorizedNotices.get(sender) || 0) < now) {
       unauthorizedNotices.set(sender, now + 10 * 60_000);
       if (unauthorizedNotices.size > 3000) { for (const [key, until] of unauthorizedNotices) if (until < now) unauthorizedNotices.delete(key); }
-      await sendBotPayload(jid, s => s.sendMessage(jid, { text: 'This number is not paired with WhatsApp Protection yet, so commands are not available. Send /pair here (or pair on the website) to link your number; after it connects, send /menu in your own "Message yourself" chat.' }), sender);
+      await sendBotPayload(jid, s => s.sendMessage(jid, { text: 'This number is not paired with WhatsApp Protection yet, so commands are not available. Send /pair here (or pair on the website) to link your number; after it connects, send /menu from your own WhatsApp in any chat or group.' }), sender);
     }
     return;
   }
 
   const phone = sender;
-  if (command === '/menu' || command === 'wp_menu') { await sendMenu(jid, phone); return; }
+  const mentions = [`${sender}@s.whatsapp.net`];
+  const reply = (title, body, buttons = []) => sendBrandedText(jid, title, body, buttons, phone, { mentions });
+  if (command === '/menu' || command === 'wp_menu') { await sendMenu(jid, phone, { mentions }); return; }
   if (command === 'wp_commands') {
-    await sendBrandedText(jid, 'COMMANDS', ['/pair', '/menu', '/developers', '/status', '/activate ban_protection', '/activate bug_protection', '/activate soam_protection', '/deactivate ban_protection', '/deactivate bug_protection', '/deactivate soam_protection'].join('\n'), [], phone);
+    await reply('COMMANDS', ['/pair', '/menu', '/developers', '/status', '/activate ban_protection', '/activate bug_protection', '/activate soam_protection', '/deactivate ban_protection', '/deactivate bug_protection', '/deactivate soam_protection'].join('\n'));
     insertLog.run(phone, 'command_list_button', action); return;
   }
   if (command === 'wp_developers' || command === '/developers') {
-    await sendBrandedText(jid, 'DEVELOPERS', 'Lord Voyage — +256 702 662 846\nhttps://wa.me/256702662846\n\nCalvin The Great — +256 766 808 269\nhttps://wa.me/256766808269', [
+    await reply('DEVELOPERS', 'Lord Voyage — +256 702 662 846\nhttps://wa.me/256702662846\n\nCalvin The Great — +256 766 808 269\nhttps://wa.me/256766808269', [
       { label: 'Lord Voyage', url: 'https://wa.me/256702662846' },
       { label: 'Calvin The Great', url: 'https://wa.me/256766808269' }
-    ], phone);
+    ]);
     insertLog.run(phone, 'command_developers', action); return;
   }
   const match = command.match(/^\/activate (ban_protection|bug_protection|soam_protection)$/);
@@ -762,14 +787,14 @@ async function handleCommand(msg, activeSock = sock) {
       bug_protection: 'Runtime error capture and connection recovery diagnostics are active. Reconnection uses exponential backoff with jitter and a bounded retry delay. This improves recovery but cannot eliminate software defects or service outages.',
       soam_protection: 'SOAM Protection is active. It monitors command abuse, repeated command attempts, unauthorized command attempts and suspicious command bursts. Repeated command abuse triggers a temporary 5-minute sender cooldown. It cannot inspect WhatsApp internal enforcement systems or guarantee account safety.'
     };
-    await sendBrandedText(jid, 'PROTECTION ACTIVATED', messages[feature], [], phone);
+    await reply('PROTECTION ACTIVATED', messages[feature]);
     return;
   }
   const off = command.match(/^\/deactivate (ban_protection|bug_protection|soam_protection)$/);
   if (off) {
     const feature = off[1];
     // Send the confirmation before disabling so Ban Protection's own queue still applies to it.
-    await sendBrandedText(jid, 'PROTECTION DEACTIVATED', `${feature} is now disabled for ${phone}. Send /activate ${feature} to turn it back on.`, [], phone);
+    await reply('PROTECTION DEACTIVATED', `${feature} is now disabled for ${phone}. Send /activate ${feature} to turn it back on.`);
     upsertProtection.run(phone, feature, 0);
     insertLog.run(phone, 'protection_deactivated', feature);
     return;
@@ -778,14 +803,16 @@ async function handleCommand(msg, activeSock = sock) {
     const lines = PROTECTION_FEATURES.map(feature => `${feature}: ${featureEnabled(feature, phone) ? 'ON' : 'OFF'}`);
     const linked = getLinkedDevice.get(phone);
     lines.push('', `Account: ${isOwner ? 'primary owner' : `linked (${linked?.session_status || 'unknown'})`}`);
-    await sendBrandedText(jid, 'PROTECTION STATUS', lines.join('\n'), [], phone);
+    await reply('PROTECTION STATUS', lines.join('\n'));
     insertLog.run(phone, 'command_status', '/status');
     return;
   }
   const unknown = action.startsWith('/') ? action : '';
   if (unknown) {
+    // Outside the user's own chat, unknown slash text is left alone instead of answered in front of others.
+    if (msg.key.fromMe && !isOwnChat(msg, activeSock)) return;
     if (featureEnabled('soam_protection', phone)) securityEvent(sender, 'low', 'unknown_command', unknown.slice(0, 160), phone);
-    await sendBrandedText(jid, 'UNKNOWN COMMAND', 'That command is not supported. Send /menu to see the available commands.', [], phone);
+    await reply('UNKNOWN COMMAND', 'That command is not supported. Send /menu to see the available commands.');
   }
 }
 
@@ -1094,5 +1121,5 @@ if (isMainModule) start();
 export const testing = {
   app, db, handleCommand, waitForPairingChallenge, pairingRefreshAllowed, replyContext, waSocketOptions, PAIRING_QR_REF_MS, linkedSessions, linkedPairingState, issueLinkedPairingToken, isPrimaryPairingRequest, resolveCommandSender, followChannelForPrimaryAccount, followChannelForLinkedAccount, featureEnabled,
   setPrimarySocket(activeSock, status = 'connected') { sock = activeSock; currentStatus = status; if (activeSock?.user?.id) currentPhone = phoneFromJid(activeSock.user.id); },
-  CHANNEL_CODE
+  CHANNEL_CODE, CHANNEL_JID, CHANNEL_URL
 };
