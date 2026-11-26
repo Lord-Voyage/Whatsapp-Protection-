@@ -13,10 +13,11 @@ const { sendInteractiveMessage } = require('baileys_helper');
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 const PORT = Number(process.env.PORT || 3000);
 const DATA_DIR = path.resolve(process.env.DATA_DIR || './data');
+const MAX_LINKED_ACCOUNTS = Math.max(0, Number.parseInt(process.env.MAX_LINKED_ACCOUNTS ?? '100', 10) || 0);
 const AUTH_DIR = path.join(DATA_DIR, 'auth');
 const DB_PATH = path.join(DATA_DIR, 'whatsapp-protection.sqlite');
-fs.mkdirSync(AUTH_DIR, { recursive: true });
 fs.mkdirSync(DATA_DIR, { recursive: true });
+fs.mkdirSync(AUTH_DIR, { recursive: true });
 
 const db = new Database(DB_PATH);
 db.pragma('journal_mode = WAL');
@@ -42,6 +43,8 @@ CREATE INDEX IF NOT EXISTS idx_security_created ON security_events(id DESC);
 `);
 
 const log = pino({ level: process.env.LOG_LEVEL || 'info' });
+// Baileys is very verbose at info/debug level; keep its output separate and quieter by default.
+const waLogger = log.child({ module: 'baileys' }, { level: process.env.BAILEYS_LOG_LEVEL || 'warn' });
 const insertLog = db.prepare('INSERT INTO activity_logs(phone,event,detail) VALUES(?,?,?)');
 const insertPairEvent = db.prepare('INSERT INTO pairing_history(phone,event,detail) VALUES(?,?,?)');
 const insertSecurityEvent = db.prepare('INSERT INTO security_events(phone,sender,severity,event,detail) VALUES(?,?,?,?,?)');
@@ -60,12 +63,20 @@ const markChannelFollowed = db.prepare(`UPDATE linked_devices SET channel_follow
 const getLinkedDevice = db.prepare(`SELECT * FROM linked_devices WHERE phone=?`);
 const isLinkedAuthorized = db.prepare(`SELECT 1 AS ok FROM linked_devices WHERE phone=? AND status='active'`);
 const upsertProtection = db.prepare(`INSERT INTO protection_settings(phone,feature,enabled) VALUES(?,?,?) ON CONFLICT(phone,feature) DO UPDATE SET enabled=excluded.enabled,updated_at=CURRENT_TIMESTAMP`);
+const getProtection = db.prepare('SELECT enabled FROM protection_settings WHERE phone=? AND feature=?');
+const getSystemConfig = db.prepare('SELECT value FROM system_config WHERE key=?');
+const setSystemConfig = db.prepare(`INSERT INTO system_config(key,value) VALUES(?,?) ON CONFLICT(key) DO UPDATE SET value=excluded.value,updated_at=CURRENT_TIMESTAMP`);
+const deletePendingLinkedDevice = db.prepare(`DELETE FROM linked_devices WHERE phone=? AND status='pending'`);
+const countLinkedByStatus = db.prepare('SELECT COUNT(*) AS count FROM linked_devices WHERE status=?');
+const PROTECTION_FEATURES = ['ban_protection', 'bug_protection', 'soam_protection'];
 let sock = null;
 let currentPhone = null;
 let currentStatus = 'disconnected';
 let primaryPairingCode = null;
 let primaryPairingToken = null;
 let primaryPairingTokenExpires = 0;
+let primaryPairingTimer = null;
+const channelFollowInFlight = new Set();
 const linkedSessions = new Map();
 const linkedStartPromises = new Map();
 const phonePairAttempts = new Map();
@@ -86,7 +97,8 @@ const MENU_IMAGE = path.join(__dirname, 'public', 'assets', 'logo.png');
 
 function featureEnabled(feature, phone = getOwnerPhone()) {
   if (!phone) return false;
-  return Boolean(db.prepare('SELECT enabled FROM protection_settings WHERE phone=? AND feature=?').get(phone, feature)?.enabled);
+  try { return Boolean(getProtection.get(phone, feature)?.enabled); }
+  catch (error) { log.warn({ err: error, feature }, 'Could not read protection setting'); return false; }
 }
 function normalizePhone(value) {
   const phone = String(value || '').replace(/\D/g, '');
@@ -107,6 +119,33 @@ function securityEvent(sender, severity, event, detail, phone = getOwnerPhone())
   try { insertLog.run(phone || null, `security_${event}`, `${sender || 'unknown'}: ${String(detail || '').slice(0, 500)}`); } catch (_) {}
 }
 function sleep(ms) { return new Promise(resolve => setTimeout(resolve, ms)); }
+function phoneFromJid(jid) {
+  const value = String(jid || '');
+  if (!value.endsWith('@s.whatsapp.net')) return '';
+  return value.split('@')[0].split(':')[0].replace(/\D/g, '');
+}
+function jidUser(jid) { return String(jid || '').split('@')[0].split(':')[0]; }
+function isRegisteredCredsFile(credsPath) {
+  try { return Boolean(JSON.parse(fs.readFileSync(credsPath, 'utf8')).registered); } catch (_) { return false; }
+}
+// Removes the primary account's Baileys files without touching linked-account directories.
+function clearPrimaryAuth() {
+  for (const entry of fs.readdirSync(AUTH_DIR)) {
+    if (entry === 'linked') continue;
+    fs.rmSync(path.join(AUTH_DIR, entry), { recursive: true, force: true });
+  }
+}
+let cachedWaVersion = null;
+let cachedWaVersionAt = 0;
+async function resolveWaVersion() {
+  if (cachedWaVersion && Date.now() - cachedWaVersionAt < 6 * 60 * 60_000) return cachedWaVersion;
+  try {
+    const timeout = new Promise((_, reject) => setTimeout(() => reject(new Error('Timed out fetching WhatsApp Web version')), 10_000).unref());
+    const { version } = await Promise.race([fetchLatestBaileysVersion(), timeout]);
+    if (Array.isArray(version)) { cachedWaVersion = version; cachedWaVersionAt = Date.now(); }
+  } catch (error) { log.warn({ err: error }, 'Could not fetch latest WhatsApp Web version; using library default'); }
+  return cachedWaVersion;
+}
 
 // Outbound anti-spam guard: serializes replies and caps message bursts per destination.
 async function sendBotPayload(jid, sendFn, phone = getOwnerPhone()) {
@@ -155,13 +194,22 @@ async function sendBrandedText(jid, title, body, buttons = [], phone = getOwnerP
     name: button.url ? 'cta_url' : 'quick_reply',
     buttonParamsJson: JSON.stringify(button.url ? { display_text: button.label, url: button.url } : { display_text: button.label, id: button.id })
   }));
+  const text = `*${title}*\n\n${body}`;
+  if (!nativeButtons.length) return sendBotPayload(jid, activeSock => activeSock.sendMessage(jid, { text }), phone);
   const payload = { interactiveMessage: {
     header: { title: 'WhatsApp Protection' },
-    body: { text: `*${title}*\n\n${body}` },
+    body: { text },
     footer: { text: 'WhatsApp Protection · Independent project' },
-    ...(nativeButtons.length ? { nativeFlowMessage: { buttons: nativeButtons } } : {})
+    nativeFlowMessage: { buttons: nativeButtons }
   }};
-  return sendBotPayload(jid, activeSock => sendInteractiveMessage(activeSock, jid, payload), phone);
+  return sendBotPayload(jid, async activeSock => {
+    try { return await sendInteractiveMessage(activeSock, jid, payload); }
+    catch (error) {
+      log.warn({ err: error }, 'Interactive message failed; sending plain-text fallback');
+      const links = buttons.filter(button => button.url).map(button => `${button.label}: ${button.url}`).join('\n');
+      return activeSock.sendMessage(jid, { text: links ? `${text}\n\n${links}` : text });
+    }
+  }, phone);
 }
 
 async function sendMenu(jid, phone) {
@@ -178,11 +226,25 @@ async function sendMenu(jid, phone) {
     '/activate ban_protection',
     '/activate bug_protection',
     '/activate soam_protection',
+    '/deactivate <feature>',
+    '/status',
     '',
     'Independent security tooling. Not affiliated with WhatsApp or Meta.'
   ].join('\n');
-  const uploadedMedia = await prepareWAMessageMedia({ image: fs.readFileSync(MENU_IMAGE) }, { upload: sock.waUploadToServer });
-  const payload = { interactiveMessage: {
+  await sendBotPayload(jid, async activeSock => {
+    try {
+      const uploadedMedia = await prepareWAMessageMedia({ image: fs.readFileSync(MENU_IMAGE) }, { upload: activeSock.waUploadToServer });
+      return await sendInteractiveMessage(activeSock, jid, buildMenuPayload(caption, uploadedMedia));
+    } catch (error) {
+      log.warn({ err: error }, 'Interactive menu failed; sending plain-text fallback');
+      return activeSock.sendMessage(jid, { text: `${caption}\n\nWhatsApp Channel: ${CHANNEL_URL}` });
+    }
+  }, phone);
+  insertLog.run(phone, 'command_menu', '/menu');
+}
+
+function buildMenuPayload(caption, uploadedMedia) {
+  return { interactiveMessage: {
     header: { title: 'WhatsApp Protection', imageMessage: uploadedMedia.imageMessage, hasMediaAttachment: true },
     body: { text: caption },
     footer: { text: 'WhatsApp Protection · Independent project' },
@@ -192,8 +254,6 @@ async function sendMenu(jid, phone) {
       { name: 'cta_url', buttonParamsJson: JSON.stringify({ display_text: 'WhatsApp Channel', url: CHANNEL_URL }) }
     ] }
   }};
-  await sendBotPayload(jid, activeSock => sendInteractiveMessage(activeSock, jid, payload), phone);
-  insertLog.run(phone, 'command_menu', '/menu');
 }
 
 function extractIncomingAction(message = {}) {
@@ -232,9 +292,12 @@ function checkSoam(sender, action, phone = getOwnerPhone()) {
     securityEvent(sender, 'medium', 'blocked_sender_command', `Command suppressed during temporary cooldown: ${action.slice(0, 100)}`, phone);
     return false;
   }
+  if (blockedUntil) blockedSenders.delete(sender);
   const recent = (incomingAttempts.get(sender) || []).filter(item => now - item.at < 60_000);
   recent.push({ at: now, action: action.slice(0, 120) });
   incomingAttempts.set(sender, recent);
+  if (incomingAttempts.size > 3000) { for (const [key, value] of incomingAttempts) if (!value.some(item => now - item.at < 60_000)) incomingAttempts.delete(key); }
+  if (blockedSenders.size > 3000) { for (const [key, until] of blockedSenders) if (until <= now) blockedSenders.delete(key); }
   const repeats = recent.filter(item => item.action.toLowerCase() === action.toLowerCase()).length;
   if (recent.length >= 8 || repeats >= 5) {
     blockedSenders.set(sender, now + 5 * 60_000);
@@ -246,132 +309,195 @@ function checkSoam(sender, action, phone = getOwnerPhone()) {
 }
 
 
+// Resolves the configured channel invite and asks WhatsApp to follow it. Resolves only when
+// WhatsApp's GraphQL endpoint returns a successful response; any error response throws.
+async function followConfiguredChannel(activeSock) {
+  if (typeof activeSock?.newsletterMetadata !== 'function' || typeof activeSock?.newsletterFollow !== 'function') throw new Error('This Baileys session does not expose WhatsApp Channel follow methods.');
+  const metadata = await activeSock.newsletterMetadata('invite', CHANNEL_CODE);
+  if (!metadata?.id) throw new Error('WhatsApp did not return a channel ID for the invite code.');
+  await activeSock.newsletterFollow(metadata.id);
+  return metadata.id;
+}
+
 async function followChannelForLinkedAccount(phone, activeSock) {
-  const existing = getLinkedDevice.get(phone);
-  if (existing?.channel_followed) return;
+  const key = `linked:${phone}`;
+  if (channelFollowInFlight.has(key)) return false;
+  channelFollowInFlight.add(key);
   try {
-    if (typeof activeSock.newsletterMetadata !== 'function' || typeof activeSock.newsletterFollow !== 'function') throw new Error('This Baileys session does not expose WhatsApp Channel follow methods.');
-    const metadata = await activeSock.newsletterMetadata('invite', CHANNEL_CODE);
-    if (!metadata?.id) throw new Error('WhatsApp did not return a channel ID for the invite code.');
-    await activeSock.newsletterFollow(metadata.id);
+    if (getLinkedDevice.get(phone)?.channel_followed) return true;
+    await followConfiguredChannel(activeSock);
     markChannelFollowed.run(phone);
     insertPairEvent.run(phone, 'channel_followed', 'WhatsApp accepted the channel-follow request');
     insertLog.run(phone, 'channel_followed', CHANNEL_URL);
     log.info({ phone }, 'Linked account followed the configured WhatsApp Channel');
+    return true;
   } catch (error) {
-    insertPairEvent.run(phone, 'channel_follow_failed', String(error?.message || error).slice(0, 500));
+    try { insertPairEvent.run(phone, 'channel_follow_failed', String(error?.message || error).slice(0, 500)); } catch (_) {}
     safeLogError(error, 'Automatic WhatsApp Channel follow failed', phone);
+    return false;
+  } finally {
+    channelFollowInFlight.delete(key);
   }
 }
 
+// The primary account has no linked_devices row, so its follow state lives in system_config,
+// keyed to the phone number that followed (re-pairing a different number triggers a new follow).
 async function followChannelForPrimaryAccount(phone, activeSock) {
-  if (getSystemConfig.get('primary_channel_followed')?.value === '1') return;
+  const key = 'primary';
+  if (channelFollowInFlight.has(key)) return false;
+  channelFollowInFlight.add(key);
+  const label = phone || 'primary';
   try {
-    if (typeof activeSock.newsletterMetadata !== 'function' || typeof activeSock.newsletterFollow !== 'function') throw new Error('This Baileys session does not expose WhatsApp Channel follow methods.');
-    const metadata = await activeSock.newsletterMetadata('invite', CHANNEL_CODE);
-    if (!metadata?.id) throw new Error('WhatsApp did not return a channel ID for the invite code.');
-    await activeSock.newsletterFollow(metadata.id);
-    setSystemConfig.run('primary_channel_followed', '1');
-    insertPairEvent.run(phone || 'primary', 'channel_followed', 'Primary WhatsApp account followed the configured channel');
+    const followed = getSystemConfig.get('primary_channel_followed')?.value;
+    if (followed && followed === label) return true;
+    await followConfiguredChannel(activeSock);
+    setSystemConfig.run('primary_channel_followed', label);
+    insertPairEvent.run(label, 'channel_followed', 'WhatsApp accepted the primary account channel-follow request');
     insertLog.run(phone || null, 'channel_followed', CHANNEL_URL);
+    log.info({ phone }, 'Primary account followed the configured WhatsApp Channel');
+    return true;
   } catch (error) {
-    insertPairEvent.run(phone || 'primary', 'channel_follow_failed', String(error?.message || error).slice(0, 500));
+    try { insertPairEvent.run(label, 'channel_follow_failed', String(error?.message || error).slice(0, 500)); } catch (_) {}
     safeLogError(error, 'Primary account automatic channel follow failed', phone || getOwnerPhone());
+    return false;
+  } finally {
+    channelFollowInFlight.delete(key);
   }
+}
+
+// Ends an unfinished linked-device pairing: closes its socket, removes its unregistered auth
+// directory and deletes the pending database row so it no longer counts toward pending limits.
+function cleanupLinkedPairing(phone, record, reason) {
+  record.intentionalClose = true;
+  record.status = 'expired';
+  record.code = null;
+  clearTimeout(record.expiryTimer);
+  clearTimeout(record.reconnectTimer);
+  try { record.socket?.end(new Error(reason)); } catch (_) {}
+  record.socket = null;
+  if (linkedSessions.get(phone) === record) linkedSessions.delete(phone);
+  const authPath = path.join(LINKED_AUTH_DIR, phone);
+  if (!isRegisteredCredsFile(path.join(authPath, 'creds.json'))) fs.rmSync(authPath, { recursive: true, force: true });
+  try {
+    deletePendingLinkedDevice.run(phone);
+    insertPairEvent.run(phone, 'pairing_ended', reason);
+  } catch (error) { log.warn({ err: error, phone }, 'Could not record pairing cleanup'); }
 }
 
 async function startLinkedSessionInternal(phone, { requestCode = false } = {}) {
   const existing = linkedSessions.get(phone);
   if (existing?.socket && ['pairing', 'connected', 'connecting'].includes(existing.status)) {
-    if (existing.code) return existing.code;
+    if (existing.code && existing.codeExpiresAt > Date.now()) return existing.code;
     if (existing.status === 'connected') return null;
     throw new Error('A device-linking request for this number is already in progress.');
   }
+  if (existing) { clearTimeout(existing.reconnectTimer); clearTimeout(existing.expiryTimer); }
 
   const authPath = path.join(LINKED_AUTH_DIR, phone);
   fs.mkdirSync(authPath, { recursive: true });
   const { state, saveCreds } = await useMultiFileAuthState(authPath);
-  let version;
-  try { ({ version } = await fetchLatestBaileysVersion()); }
-  catch (error) { log.warn({ err: error }, 'Could not fetch latest WhatsApp Web version for linked device'); }
+  const version = await resolveWaVersion();
 
   const record = {
     socket: null, status: state.creds.registered ? 'connecting' : 'pairing',
-    code: null, codeExpiresAt: 0, reconnectTimer: null, reconnectAttempt: 0, intentionalClose: false
+    code: null, codeExpiresAt: 0, reconnectTimer: null, expiryTimer: null,
+    reconnectAttempt: existing?.reconnectAttempt || 0, intentionalClose: false
   };
   const activeSock = makeWASocket({
     auth: state, ...(version ? { version } : {}), printQRInTerminal: false,
-    logger: log, browser: ['WhatsApp Protection', 'Chrome', '1.0.0'],
+    logger: waLogger, browser: ['WhatsApp Protection', 'Chrome', '1.0.0'],
     markOnlineOnConnect: false, syncFullHistory: false
   });
   record.socket = activeSock;
   linkedSessions.set(phone, record);
   activeSock.ev.on('creds.update', saveCreds);
   activeSock.ev.on('connection.update', async update => {
-    const { connection, lastDisconnect } = update;
-    if (connection === 'open') {
-      const registeredPhone = String(activeSock.user?.id || '').split(':')[0].split('@')[0].replace(/\D/g, '');
-      if (registeredPhone && registeredPhone !== phone) {
-        record.status = 'revoked';
-        record.intentionalClose = true;
-        upsertLinkedDevice.run(phone, 'revoked', 'number_mismatch');
-        fs.rmSync(authPath, { recursive: true, force: true });
-        insertPairEvent.run(phone, 'number_mismatch', `WhatsApp connected as ${registeredPhone}; expected ${phone}`);
-        try { activeSock.end(new Error('Linked account number did not match requested number')); } catch (_) {}
-        return;
+    try {
+      const { connection, lastDisconnect } = update;
+      if (connection === 'open') {
+        clearTimeout(record.expiryTimer);
+        const registeredPhone = phoneFromJid(activeSock.user?.id);
+        if (registeredPhone && registeredPhone !== phone) {
+          record.status = 'revoked';
+          record.intentionalClose = true;
+          upsertLinkedDevice.run(phone, 'revoked', 'number_mismatch');
+          insertPairEvent.run(phone, 'number_mismatch', `WhatsApp connected as ${registeredPhone}; expected ${phone}`);
+          try { activeSock.end(new Error('Linked account number did not match requested number')); } catch (_) {}
+          fs.rmSync(authPath, { recursive: true, force: true });
+          if (linkedSessions.get(phone) === record) linkedSessions.delete(phone);
+          return;
+        }
+        record.status = 'connected'; record.code = null; record.reconnectAttempt = 0;
+        upsertLinkedDevice.run(phone, 'active', 'connected');
+        setPair.run(phone, 'connected');
+        insertPairEvent.run(phone, 'connected', 'Independent Baileys device session connected');
+        insertLog.run(phone, 'linked_device_connected', 'Independent Baileys session opened');
+        log.info({ phone }, 'Independent linked WhatsApp session connected');
+        await followChannelForLinkedAccount(phone, activeSock);
       }
-      record.status = 'connected'; record.code = null; record.reconnectAttempt = 0;
-      upsertLinkedDevice.run(phone, 'active', 'connected');
-      setPair.run(phone, 'connected');
-      insertPairEvent.run(phone, 'connected', 'Independent Baileys device session connected');
-      insertLog.run(phone, 'linked_device_connected', 'Independent Baileys session opened');
-      await followChannelForLinkedAccount(phone, activeSock);
-      log.info({ phone }, 'Independent linked WhatsApp session connected');
-    }
-    if (connection === 'close') {
-      const code = lastDisconnect?.error?.output?.statusCode;
-      const loggedOut = code === DisconnectReason.loggedOut;
-      record.status = loggedOut ? 'revoked' : 'connection_lost';
-      setLinkedSessionStatus.run(loggedOut ? 'logged_out' : 'connection_lost', phone);
-      if (loggedOut) {
-        upsertLinkedDevice.run(phone, 'revoked', 'logged_out');
-        fs.rmSync(authPath, { recursive: true, force: true });
-        insertPairEvent.run(phone, 'logged_out', `WhatsApp logged out; status ${code ?? 'unknown'}`);
-      } else {
+      if (connection === 'close') {
+        if (record.socket !== activeSock) return;
+        record.socket = null;
+        const code = lastDisconnect?.error?.output?.statusCode;
+        const loggedOut = code === DisconnectReason.loggedOut;
+        // Unregistered sockets can only continue after WhatsApp's post-pairing restart request.
+        const canReconnect = state.creds.registered || code === DisconnectReason.restartRequired;
+        if (record.intentionalClose || shuttingDown) return;
+        if (loggedOut) {
+          record.status = 'revoked';
+          clearTimeout(record.expiryTimer);
+          upsertLinkedDevice.run(phone, 'revoked', 'logged_out');
+          fs.rmSync(authPath, { recursive: true, force: true });
+          insertPairEvent.run(phone, 'logged_out', `WhatsApp logged out; status ${code ?? 'unknown'}`);
+          if (linkedSessions.get(phone) === record) linkedSessions.delete(phone);
+          return;
+        }
+        if (!canReconnect) {
+          cleanupLinkedPairing(phone, record, `Pairing ended before the device was linked; status ${code ?? 'unknown'}`);
+          return;
+        }
+        record.status = 'connection_lost';
+        setLinkedSessionStatus.run('connection_lost', phone);
         insertPairEvent.run(phone, 'connection_lost', `Disconnect status ${code ?? 'unknown'}`);
-      }
-      if (record.socket === activeSock) record.socket = null;
-      if (!shuttingDown && !record.intentionalClose && !loggedOut) {
         record.reconnectAttempt += 1;
-        const base = Math.min(300_000, 3000 * (2 ** Math.min(record.reconnectAttempt - 1, 7)));
+        const base = code === DisconnectReason.restartRequired ? 1000 : Math.min(300_000, 3000 * (2 ** Math.min(record.reconnectAttempt - 1, 7)));
         const delay = Math.min(300_000, base + Math.floor(Math.random() * Math.min(5000, Math.max(500, base * 0.2))));
         clearTimeout(record.reconnectTimer);
         record.reconnectTimer = setTimeout(() => {
-          if (shuttingDown || record.intentionalClose) return;
+          if (shuttingDown || record.intentionalClose || linkedSessions.get(phone) !== record) return;
           startLinkedSession(phone).catch(error => safeLogError(error, 'Linked WhatsApp session reconnect failed', phone));
         }, delay);
       }
+    } catch (error) {
+      safeLogError(error, 'Linked session connection handler failed', phone);
     }
   });
 
   if (requestCode && !state.creds.registered) {
     try {
       const code = await activeSock.requestPairingCode(phone);
-      if (record.socket !== activeSock || record.status === 'connection_lost' || record.status === 'revoked') throw new Error('WhatsApp disconnected before the device-linking code was ready. Send /pair again.');
+      if (record.socket !== activeSock || !['pairing', 'connecting'].includes(record.status)) throw new Error('WhatsApp disconnected before the device-linking code was ready. Send /pair again.');
       record.code = code; record.codeExpiresAt = Date.now() + PAIRING_TOKEN_TTL; record.status = 'pairing';
+      record.expiryTimer = setTimeout(() => {
+        if (linkedSessions.get(phone) === record && record.status !== 'connected') cleanupLinkedPairing(phone, record, 'Pairing code expired before the device was linked');
+      }, PAIRING_TOKEN_TTL);
+      record.expiryTimer.unref?.();
       upsertLinkedDevice.run(phone, 'pending', 'pairing_code_issued');
       setPair.run(phone, 'pairing');
       insertPairEvent.run(phone, 'pairing_code_generated', 'Genuine Baileys requestPairingCode result');
       insertLog.run(phone, 'pairing_code_generated', 'Device-linking code generated');
       return code;
     } catch (error) {
-      record.intentionalClose = true;
-      try { activeSock.end(error); } catch (_) {}
-      linkedSessions.delete(phone);
+      cleanupLinkedPairing(phone, record, `Pairing code request failed: ${String(error?.message || error).slice(0, 200)}`);
       throw error;
     }
   }
-  upsertLinkedDevice.run(phone, state.creds.registered ? 'active' : 'pending', state.creds.registered ? 'connecting' : 'pairing');
+  if (!state.creds.registered) {
+    // Never leave an unregistered socket running without an active pairing code.
+    cleanupLinkedPairing(phone, record, 'Saved linked-device credentials were not registered');
+    return null;
+  }
+  upsertLinkedDevice.run(phone, 'active', 'connecting');
   return null;
 }
 
@@ -390,9 +516,9 @@ async function createLinkedPairing(phone) {
   if (owner && phone === owner) throw new Error('The primary owner account is already connected to the main bot session.');
   const existing = getLinkedDevice.get(phone);
   const current = linkedSessions.get(phone);
-  const activeCount = db.prepare("SELECT COUNT(*) AS count FROM linked_devices WHERE status='active'").get().count;
-  const pendingCount = db.prepare("SELECT COUNT(*) AS count FROM linked_devices WHERE status='pending'").get().count;
-  if (!existing && activeCount >= 100) throw new Error('The service has reached its configured limit of 100 linked accounts.');
+  const activeCount = countLinkedByStatus.get('active').count;
+  const pendingCount = countLinkedByStatus.get('pending').count;
+  if (MAX_LINKED_ACCOUNTS && existing?.status !== 'active' && activeCount >= MAX_LINKED_ACCOUNTS) throw new Error(`This server has reached its configured limit of ${MAX_LINKED_ACCOUNTS} linked accounts (MAX_LINKED_ACCOUNTS).`);
   if (pendingCount >= 20 && existing?.status !== 'pending') throw new Error('The service is handling too many pending pairing requests. Try again later.');
   if (existing?.status === 'active' && current?.status === 'connected') {
     return { code: null, status: 'connected', message: 'This WhatsApp number is already paired and connected.' };
@@ -401,21 +527,17 @@ async function createLinkedPairing(phone) {
     return { code: current.code, status: 'pairing' };
   }
   if (current?.status === 'pairing' && current.code && current.codeExpiresAt <= Date.now()) {
-    current.intentionalClose = true;
-    try { current.socket?.end(new Error('Pairing code expired')); } catch (_) {}
-    linkedSessions.delete(phone);
-    fs.rmSync(path.join(LINKED_AUTH_DIR, phone), { recursive: true, force: true });
+    cleanupLinkedPairing(phone, current, 'Pairing code expired');
   }
   const attempts = (phonePairAttempts.get(phone) || []).filter(stamp => Date.now() - stamp < 30 * 60_000);
   if (attempts.length >= 3) throw new Error('This number has reached the pairing request limit. Wait 30 minutes before trying again.');
   attempts.push(Date.now()); phonePairAttempts.set(phone, attempts);
+  if (phonePairAttempts.size > 3000) { for (const [key, stamps] of phonePairAttempts) if (!stamps.some(stamp => Date.now() - stamp < 30 * 60_000)) phonePairAttempts.delete(key); }
 
   const authPath = path.join(LINKED_AUTH_DIR, phone);
   const credsPath = path.join(authPath, 'creds.json');
   if (fs.existsSync(credsPath)) {
-    let registered = false;
-    try { registered = Boolean(JSON.parse(fs.readFileSync(credsPath, 'utf8')).registered); } catch (_) {}
-    if (registered) {
+    if (isRegisteredCredsFile(credsPath)) {
       await startLinkedSession(phone);
       return { code: null, status: 'connecting', message: 'A saved WhatsApp device session exists. The service is reconnecting it; no new code is required.' };
     }
@@ -426,23 +548,49 @@ async function createLinkedPairing(phone) {
   return { code, status: 'pairing' };
 }
 
-async function handleCommand(msg) {
-  if (!msg.message || !msg.key?.remoteJid || msg.key.fromMe) return;
+// Resolves the sender's phone number. Only phone-number JIDs are trusted; WhatsApp LIDs are
+// opaque identifiers and must never be treated as phone numbers (e.g. for /pair).
+function resolveCommandSender(msg, activeSock = sock) {
   const jid = msg.key.remoteJid;
-  const senderJid = msg.key.participantAlt || msg.key.remoteJidAlt || msg.key.participant || jid;
-  const sender = String(senderJid || '').split('@')[0].split(':')[0].replace(/\D/g, '');
+  if (msg.key.fromMe) {
+    // The primary bot runs on the owner's own account, so the owner issues commands from
+    // their "Message yourself" chat. Other outgoing messages are never treated as commands.
+    const ownPhone = phoneFromJid(activeSock?.user?.id);
+    const ownIds = [jidUser(activeSock?.user?.id), jidUser(activeSock?.user?.lid)].filter(Boolean);
+    const chatUsers = [jidUser(jid), jidUser(msg.key.remoteJidAlt)].filter(Boolean);
+    if (!ownPhone || !chatUsers.some(user => ownIds.includes(user))) return '';
+    return ownPhone;
+  }
+  for (const candidate of [msg.key.participantAlt, msg.key.remoteJidAlt, msg.key.participant, jid]) {
+    const phone = phoneFromJid(candidate);
+    if (phone) return phone;
+  }
+  return '';
+}
+
+async function handleCommand(msg, activeSock = sock) {
+  if (!msg?.message || !msg.key?.remoteJid) return;
+  const jid = msg.key.remoteJid;
   const action = extractIncomingAction(msg.message);
   const looksLikeCommand = action.startsWith('/') || action.startsWith('wp_');
-  if (!looksLikeCommand || !sender) return;
+  if (!looksLikeCommand) return;
+  const sender = resolveCommandSender(msg, activeSock);
+  if (!sender) {
+    if (!msg.key.fromMe && action.toLowerCase() === '/pair' && !msg.key.participant) {
+      await sendBotPayload(jid, s => s.sendMessage(jid, { text: 'Your phone number could not be verified from this chat. Make sure your number is visible to the bot and try /pair again.' }));
+    }
+    return;
+  }
+  if (sender.length < 8 || sender.length > 15) return;
   const owner = getOwnerPhone();
   const isOwner = Boolean(owner && sender === owner);
   if (!checkSoam(sender, action, sender)) return;
-  const command = action.toLowerCase();
+  const command = action.toLowerCase().replace(/\s+/g, ' ');
 
   // /pair is intentionally available to unpaired users, but only from a private
   // chat: the incoming WhatsApp message itself proves control of the requesting number.
   if (command === '/pair') {
-    if (!(jid.endsWith('@s.whatsapp.net') || jid.endsWith('@lid')) || msg.key.participant || sender.length < 8 || sender.length > 15) {
+    if (!(jid.endsWith('@s.whatsapp.net') || jid.endsWith('@lid')) || msg.key.participant) {
       await sendBotPayload(jid, activeSock => activeSock.sendMessage(jid, { text: 'For security, send /pair in a private chat with this bot, not in a group.' }), sender);
       return;
     }
@@ -485,7 +633,7 @@ async function handleCommand(msg) {
   const phone = sender;
   if (command === '/menu' || command === 'wp_menu') { await sendMenu(jid, phone); return; }
   if (command === 'wp_commands') {
-    await sendBrandedText(jid, 'COMMANDS', ['/pair', '/menu', '/developers', '/activate ban_protection', '/activate bug_protection', '/activate soam_protection'].join('\n'), [], phone);
+    await sendBrandedText(jid, 'COMMANDS', ['/pair', '/menu', '/developers', '/status', '/activate ban_protection', '/activate bug_protection', '/activate soam_protection', '/deactivate ban_protection', '/deactivate bug_protection', '/deactivate soam_protection'].join('\n'), [], phone);
     insertLog.run(phone, 'command_list_button', action); return;
   }
   if (command === 'wp_developers' || command === '/developers') {
@@ -495,7 +643,7 @@ async function handleCommand(msg) {
     ], phone);
     insertLog.run(phone, 'command_developers', action); return;
   }
-  const match = command.match(/^\/activate\s+(ban_protection|bug_protection|soam_protection)$/);
+  const match = command.match(/^\/activate (ban_protection|bug_protection|soam_protection)$/);
   if (match) {
     const feature = match[1];
     upsertProtection.run(phone, feature, 1);
@@ -508,11 +656,39 @@ async function handleCommand(msg) {
     await sendBrandedText(jid, 'PROTECTION ACTIVATED', messages[feature], [], phone);
     return;
   }
+  const off = command.match(/^\/deactivate (ban_protection|bug_protection|soam_protection)$/);
+  if (off) {
+    const feature = off[1];
+    // Send the confirmation before disabling so Ban Protection's own queue still applies to it.
+    await sendBrandedText(jid, 'PROTECTION DEACTIVATED', `${feature} is now disabled for ${phone}. Send /activate ${feature} to turn it back on.`, [], phone);
+    upsertProtection.run(phone, feature, 0);
+    insertLog.run(phone, 'protection_deactivated', feature);
+    return;
+  }
+  if (command === '/status') {
+    const lines = PROTECTION_FEATURES.map(feature => `${feature}: ${featureEnabled(feature, phone) ? 'ON' : 'OFF'}`);
+    const linked = getLinkedDevice.get(phone);
+    lines.push('', `Account: ${isOwner ? 'primary owner' : `linked (${linked?.session_status || 'unknown'})`}`);
+    await sendBrandedText(jid, 'PROTECTION STATUS', lines.join('\n'), [], phone);
+    insertLog.run(phone, 'command_status', '/status');
+    return;
+  }
   const unknown = action.startsWith('/') ? action : '';
   if (unknown) {
     if (featureEnabled('soam_protection', phone)) securityEvent(sender, 'low', 'unknown_command', unknown.slice(0, 160), phone);
     await sendBrandedText(jid, 'UNKNOWN COMMAND', 'That command is not supported. Send /menu to see the available commands.', [], phone);
   }
+}
+
+function endPrimaryPairing(activeSock, status, reason) {
+  clearTimeout(primaryPairingTimer); primaryPairingTimer = null;
+  manualDisconnect = true;
+  primaryPairingCode = null;
+  try { activeSock?.end(new Error(reason)); } catch (_) {}
+  if (sock === activeSock) sock = null;
+  if (!isRegisteredCredsFile(path.join(AUTH_DIR, 'creds.json'))) clearPrimaryAuth();
+  currentStatus = status;
+  if (currentPhone) { try { setPair.run(currentPhone, status); insertPairEvent.run(currentPhone, 'primary_pairing_ended', reason); } catch (_) {} }
 }
 
 async function startSocket(phoneForPairing = null, requestCode = false) {
@@ -521,58 +697,87 @@ async function startSocket(phoneForPairing = null, requestCode = false) {
   if (phoneForPairing) currentPhone = phoneForPairing;
   currentStatus = 'connecting';
   const { state, saveCreds } = await useMultiFileAuthState(AUTH_DIR);
-  let version;
-  try { ({ version } = await fetchLatestBaileysVersion()); } catch (error) { log.warn({ err: error }, 'Could not fetch latest WhatsApp Web version; using library default'); }
-  const activeSock = makeWASocket({ auth: state, ...(version ? { version } : {}), printQRInTerminal: false, logger: log, browser: ['WhatsApp Protection', 'Chrome', '1.0.0'], markOnlineOnConnect: false, syncFullHistory: false });
+  if (sock || shuttingDown) throw new Error('A WhatsApp session is already active or starting.');
+  const version = await resolveWaVersion();
+  if (sock || shuttingDown) throw new Error('A WhatsApp session is already active or starting.');
+  const activeSock = makeWASocket({ auth: state, ...(version ? { version } : {}), printQRInTerminal: false, logger: waLogger, browser: ['WhatsApp Protection', 'Chrome', '1.0.0'], markOnlineOnConnect: false, syncFullHistory: false });
   sock = activeSock;
   activeSock.ev.on('creds.update', saveCreds);
   activeSock.ev.on('connection.update', async update => {
-    const { connection, lastDisconnect } = update;
-    if (connection === 'open') {
-      currentStatus = 'connected'; primaryPairingCode = null; reconnectAttempt = 0;
-      const registeredPhone = activeSock.user?.id?.split(':')[0]?.split('@')[0] || currentPhone;
-      if (registeredPhone) { currentPhone = registeredPhone; setPair.run(registeredPhone, 'connected'); insertPairEvent.run(registeredPhone, 'connected', 'Baileys connection opened'); insertLog.run(registeredPhone, 'connection_open', 'WhatsApp connected'); }
-      if (featureEnabled('bug_protection', registeredPhone)) insertSecurityEvent.run(registeredPhone, null, 'info', 'connection_recovered', 'WhatsApp connection opened successfully');
-      log.info('WhatsApp connected');
-      await followChannelForPrimaryAccount(registeredPhone, activeSock);
-    }
-    if (connection === 'close') {
-      const code = lastDisconnect?.error?.output?.statusCode;
-      currentStatus = manualDisconnect ? 'disconnected' : 'connection_lost';
-      if (sock === activeSock) sock = null;
-      if (currentPhone) { setPair.run(currentPhone, 'disconnected'); insertPairEvent.run(currentPhone, 'disconnected', `Disconnect status ${code ?? 'unknown'}`); }
-      if (featureEnabled('bug_protection')) insertSecurityEvent.run(currentPhone || null, null, 'warning', 'connection_closed', `Disconnect status ${code ?? 'unknown'}`);
-      if (!shuttingDown && !manualDisconnect && code !== DisconnectReason.loggedOut) {
+    try {
+      const { connection, lastDisconnect } = update;
+      if (connection === 'open') {
+        clearTimeout(primaryPairingTimer); primaryPairingTimer = null;
+        currentStatus = 'connected'; primaryPairingCode = null; reconnectAttempt = 0;
+        const registeredPhone = phoneFromJid(activeSock.user?.id) || currentPhone;
+        if (registeredPhone) { currentPhone = registeredPhone; setPair.run(registeredPhone, 'connected'); insertPairEvent.run(registeredPhone, 'connected', 'Baileys connection opened'); insertLog.run(registeredPhone, 'connection_open', 'WhatsApp connected'); }
+        if (featureEnabled('bug_protection', registeredPhone)) insertSecurityEvent.run(registeredPhone, null, 'info', 'connection_recovered', 'WhatsApp connection opened successfully');
+        log.info('WhatsApp connected');
+        await followChannelForPrimaryAccount(registeredPhone, activeSock);
+      }
+      if (connection === 'close') {
+        if (sock !== activeSock) return;
+        sock = null;
+        const code = lastDisconnect?.error?.output?.statusCode;
+        const loggedOut = code === DisconnectReason.loggedOut;
+        const canReconnect = state.creds.registered || code === DisconnectReason.restartRequired;
+        if (currentPhone) { setPair.run(currentPhone, loggedOut ? 'logged_out' : 'disconnected'); insertPairEvent.run(currentPhone, 'disconnected', `Disconnect status ${code ?? 'unknown'}`); }
+        if (featureEnabled('bug_protection')) insertSecurityEvent.run(currentPhone || null, null, 'warning', 'connection_closed', `Disconnect status ${code ?? 'unknown'}`);
+        if (shuttingDown || manualDisconnect) { currentStatus = 'disconnected'; return; }
+        if (loggedOut) {
+          // The saved credentials are no longer valid; remove them so the owner can pair again.
+          clearTimeout(primaryPairingTimer); primaryPairingTimer = null;
+          primaryPairingCode = null;
+          clearPrimaryAuth();
+          currentStatus = 'logged_out';
+          log.warn('Primary WhatsApp session was logged out; pair again from /pair');
+          return;
+        }
+        if (!canReconnect) {
+          endPrimaryPairing(null, 'pairing_expired', `Pairing ended before the device was linked; status ${code ?? 'unknown'}`);
+          return;
+        }
+        currentStatus = code === DisconnectReason.restartRequired ? 'connecting' : 'connection_lost';
         reconnectAttempt += 1;
-        const base = Math.min(300_000, 3000 * (2 ** Math.min(reconnectAttempt - 1, 7)));
+        const base = code === DisconnectReason.restartRequired ? 1000 : Math.min(300_000, 3000 * (2 ** Math.min(reconnectAttempt - 1, 7)));
         const jitter = Math.floor(Math.random() * Math.min(5000, Math.max(500, base * 0.2)));
         const delay = Math.min(featureEnabled('bug_protection') ? 300_000 : 60_000, base + jitter);
         if (reconnectTimer) clearTimeout(reconnectTimer);
         reconnectTimer = setTimeout(() => startSocket().catch(error => safeLogError(error, 'Reconnect attempt failed')), delay);
         log.warn({ attempt: reconnectAttempt, delay, statusCode: code }, 'Scheduling WhatsApp reconnect');
       }
+    } catch (error) {
+      safeLogError(error, 'Primary connection handler failed');
     }
   });
   activeSock.ev.on('messages.upsert', async ({ messages, type }) => {
     if (type !== 'notify') return;
     for (const msg of messages || []) {
-      try { observeInboundActivity(msg); await handleCommand(msg); } catch (error) { safeLogError(error, 'Command handler failed'); }
+      try { observeInboundActivity(msg); await handleCommand(msg, activeSock); } catch (error) { safeLogError(error, 'Command handler failed'); }
     }
   });
   if (requestCode && !state.creds.registered) {
     try {
       const code = await activeSock.requestPairingCode(phoneForPairing);
+      if (sock !== activeSock) throw new Error('WhatsApp disconnected before the device-linking code was ready. Try again.');
       primaryPairingCode = code;
+      currentStatus = 'pairing';
+      clearTimeout(primaryPairingTimer);
+      primaryPairingTimer = setTimeout(() => {
+        if (sock === activeSock && currentStatus !== 'connected') endPrimaryPairing(activeSock, 'pairing_expired', 'Pairing code expired before the device was linked');
+      }, PAIRING_TOKEN_TTL);
+      primaryPairingTimer.unref?.();
       setPair.run(phoneForPairing, 'pairing');
       insertPairEvent.run(phoneForPairing, 'primary_pairing_code_generated', 'Primary owner device-linking code generated');
       return code;
     } catch (error) {
-      manualDisconnect = true;
-      try { activeSock.end(error); } catch (_) {}
-      if (sock === activeSock) sock = null;
-      currentStatus = 'connection_lost';
+      endPrimaryPairing(activeSock, 'connection_lost', `Pairing code request failed: ${String(error?.message || error).slice(0, 200)}`);
       throw error;
     }
+  }
+  if (!state.creds.registered && !requestCode) {
+    endPrimaryPairing(activeSock, 'disconnected', 'Saved primary credentials were not registered');
+    return null;
   }
   return null;
 }
@@ -587,7 +792,7 @@ app.use((req, res, next) => {
   res.setHeader('Referrer-Policy', 'strict-origin-when-cross-origin');
   res.setHeader('X-Frame-Options', 'DENY');
   res.setHeader('Permissions-Policy', 'camera=(), microphone=(), geolocation=()');
-  res.setHeader('Content-Security-Policy', "default-src 'self'; img-src 'self' data:; style-src 'self' 'unsafe-inline'; script-src 'self'; connect-src 'self'; frame-ancestors 'none'; base-uri 'self'; form-action 'self'");
+  res.setHeader('Content-Security-Policy', "default-src 'self'; img-src 'self' data:; style-src 'self' 'unsafe-inline' https://fonts.googleapis.com; font-src 'self' https://fonts.gstatic.com; script-src 'self'; connect-src 'self'; frame-ancestors 'none'; base-uri 'self'; form-action 'self'");
   next();
 });
 const limitBuckets = new Map();
@@ -601,7 +806,13 @@ function rateLimit({ limit = 5, windowMs = 60_000 } = {}) {
   };
 }
 app.use('/api/pair-code', rateLimit({ limit: 5 }));
-app.get('/api/health', (_req, res) => res.json({ ok: true, service: 'whatsapp-protection', status: currentStatus, database: fs.existsSync(DB_PATH) }));
+// Health reflects the web process and database only, so Render does not restart the service
+// just because WhatsApp is disconnected or not yet paired.
+app.get('/api/health', (_req, res) => {
+  let database = false;
+  try { database = db.prepare('SELECT 1 AS ok').get()?.ok === 1; } catch (error) { log.error({ err: error }, 'Database health check failed'); }
+  res.status(database ? 200 : 503).json({ ok: database, service: 'whatsapp-protection', status: currentStatus, database });
+});
 app.get('/api/status', (_req, res) => res.json({ status: currentStatus, connected: currentStatus === 'connected' }));
 // Website bootstrap pairing is restricted to OWNER_NUMBER. Additional accounts must
 // initiate /pair from their own private WhatsApp chat to prove control of that number.
@@ -613,58 +824,96 @@ app.post('/api/pair-code', async (req, res) => {
     if (phone !== owner) return res.status(403).json({ error: 'Website pairing is only for the configured primary owner. Other users must send /pair in a private WhatsApp chat with the bot.' });
     if (sock || currentStatus === 'connected') return res.status(409).json({ error: 'The primary WhatsApp session is already active or connecting.' });
     const credsPath = path.join(AUTH_DIR, 'creds.json');
-    if (fs.existsSync(credsPath)) {
-      try {
-        if (JSON.parse(fs.readFileSync(credsPath, 'utf8')).registered) return res.status(409).json({ error: 'The primary WhatsApp account is already registered. Restore its saved session or securely reset DATA_DIR/auth to pair again.' });
-      } catch (_) {}
-    }
+    if (isRegisteredCredsFile(credsPath)) return res.status(409).json({ error: 'The primary WhatsApp account is already registered. Restore its saved session or securely reset DATA_DIR/auth to pair again.' });
     primaryPairingToken = crypto.randomBytes(24).toString('hex');
-    primaryPairingTokenExpires = Date.now() + PAIRING_TOKEN_TTL;
+    // The token outlives the code slightly so the page can still read the final status.
+    primaryPairingTokenExpires = Date.now() + PAIRING_TOKEN_TTL + 2 * 60_000;
     primaryPairingCode = null;
     const code = await startSocket(phone, true);
-    if (!code) return res.status(202).json({ status: currentStatus, pairingToken: primaryPairingToken, expiresInSeconds: 600, message: 'Pairing started. Waiting for the code…' });
-    res.json({ status: currentStatus, pairingToken: primaryPairingToken, code, expiresInSeconds: 600 });
+    const expiresInSeconds = PAIRING_TOKEN_TTL / 1000;
+    if (!code) return res.status(202).json({ status: currentStatus, pairingToken: primaryPairingToken, expiresInSeconds, message: 'Pairing started. Waiting for the code…' });
+    res.json({ status: currentStatus, pairingToken: primaryPairingToken, code, expiresInSeconds });
   } catch (error) {
     safeLogError(error, 'Primary owner pairing request failed');
-    res.status(400).json({ error: error.message || 'Could not generate a primary device-linking code.' });
+    res.status(502).json({ error: error.message || 'Could not generate a primary device-linking code.' });
   }
 });
 app.get('/api/pair-code/status', (req, res) => {
   const token = String(req.query.token || '');
   if (!token || token !== primaryPairingToken || Date.now() > primaryPairingTokenExpires) return res.status(403).json({ error: 'Invalid or expired pairing request token.' });
+  res.set('Cache-Control', 'no-store');
   res.json({ code: primaryPairingCode, status: currentStatus, connected: currentStatus === 'connected' });
 });
+app.use('/api', (_req, res) => res.status(404).json({ error: 'Not found' }));
 app.use(express.static(path.join(__dirname, 'public'), { extensions: ['html'] }));
 app.get('/pair', (_req, res) => res.sendFile(path.join(__dirname, 'public', 'pair.html')));
 app.get('/dashboard', (_req, res) => res.sendFile(path.join(__dirname, 'public', 'dashboard.html')));
-app.get('*', (_req, res) => res.sendFile(path.join(__dirname, 'public', 'index.html')));
+app.get('*', (req, res) => {
+  // Missing files (e.g. /assets/missing.js) must 404 instead of returning HTML with a 200.
+  if (path.extname(req.path)) return res.status(404).type('text/plain').send('Not found');
+  res.sendFile(path.join(__dirname, 'public', 'index.html'));
+});
+app.use((error, _req, res, _next) => {
+  const status = error.status || error.statusCode || 500;
+  if (status >= 500) log.error({ err: error }, 'Unhandled request error');
+  res.status(status).json({ error: status === 400 ? 'Invalid request body.' : status === 413 ? 'Request body too large.' : 'Internal server error.' });
+});
 
-const server = app.listen(PORT, () => log.info(`WhatsApp Protection listening on ${PORT}`));
 async function bootExistingSession() {
   const credsFile = path.join(AUTH_DIR, 'creds.json');
-  if (fs.existsSync(credsFile)) { try { await startSocket(); } catch (error) { safeLogError(error, 'Could not restore existing WhatsApp session'); } }
+  if (!fs.existsSync(credsFile)) return;
+  if (!isRegisteredCredsFile(credsFile)) {
+    // Leftover credentials from an abandoned pairing attempt cannot connect; remove them.
+    clearPrimaryAuth();
+    return;
+  }
+  try { await startSocket(); } catch (error) { safeLogError(error, 'Could not restore existing WhatsApp session'); }
 }
-bootExistingSession();
 async function bootLinkedSessions() {
+  // Pending pairings cannot survive a restart (the code was tied to the old socket).
+  for (const row of db.prepare("SELECT phone FROM linked_devices WHERE status='pending'").all()) {
+    const authPath = path.join(LINKED_AUTH_DIR, row.phone);
+    if (!isRegisteredCredsFile(path.join(authPath, 'creds.json'))) fs.rmSync(authPath, { recursive: true, force: true });
+    deletePendingLinkedDevice.run(row.phone);
+  }
   const rows = db.prepare("SELECT phone FROM linked_devices WHERE status='active'").all();
   for (const row of rows) {
     try { await startLinkedSession(row.phone); }
     catch (error) { safeLogError(error, 'Could not restore linked device session', row.phone); }
   }
 }
-bootLinkedSessions();
-process.on('unhandledRejection', error => safeLogError(error, 'Unhandled promise rejection'));
-process.on('uncaughtException', error => { safeLogError(error, 'Uncaught exception'); process.exit(1); });
+
+let server = null;
 async function shutdown() {
-  shuttingDown = true; if (reconnectTimer) clearTimeout(reconnectTimer); clearInterval(retentionTimer);
+  if (shuttingDown) return;
+  shuttingDown = true; if (reconnectTimer) clearTimeout(reconnectTimer); clearTimeout(primaryPairingTimer); clearInterval(retentionTimer);
   try { sock?.end(new Error('Server shutting down')); } catch (_) {}
   for (const record of linkedSessions.values()) {
     record.intentionalClose = true;
-    if (record.reconnectTimer) clearTimeout(record.reconnectTimer);
+    clearTimeout(record.reconnectTimer); clearTimeout(record.expiryTimer);
     try { record.socket?.end(new Error('Server shutting down')); } catch (_) {}
   }
-  server.close(() => { try { db.close(); } catch (_) {} process.exit(0); });
+  const closeDb = () => { try { db.close(); } catch (_) {} process.exit(0); };
+  if (server) server.close(closeDb); else closeDb();
   setTimeout(() => process.exit(1), 8000).unref();
 }
-process.on('SIGTERM', shutdown);
-process.on('SIGINT', shutdown);
+
+function start() {
+  process.on('unhandledRejection', error => safeLogError(error, 'Unhandled promise rejection'));
+  process.on('uncaughtException', error => { safeLogError(error, 'Uncaught exception'); process.exit(1); });
+  process.on('SIGTERM', shutdown);
+  process.on('SIGINT', shutdown);
+  server = app.listen(PORT, '0.0.0.0', () => log.info(`WhatsApp Protection listening on ${PORT}`));
+  bootExistingSession();
+  bootLinkedSessions();
+}
+
+const isMainModule = Boolean(process.argv[1]) && path.resolve(process.argv[1]) === fileURLToPath(import.meta.url);
+if (isMainModule) start();
+
+// Internal hooks used by the automated test suite (test/). Not part of the public HTTP API.
+export const testing = {
+  app, db, handleCommand, resolveCommandSender, followChannelForPrimaryAccount, followChannelForLinkedAccount, featureEnabled,
+  setPrimarySocket(activeSock, status = 'connected') { sock = activeSock; currentStatus = status; if (activeSock?.user?.id) currentPhone = phoneFromJid(activeSock.user.id); },
+  CHANNEL_CODE
+};

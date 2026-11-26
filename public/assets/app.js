@@ -18,6 +18,15 @@ function showStatus(message, isError = false) {
   pairStatus.textContent = message;
   pairStatus.dataset.state = isError ? 'error' : 'info';
 }
+const FAILED_STATES = { pairing_expired: 'The pairing code expired before the device was linked. Request a new code.', connection_lost: 'The WhatsApp connection was lost before pairing completed. Try again.', logged_out: 'WhatsApp rejected the session. Request a new code.', disconnected: 'Pairing was cancelled. Request a new code.' };
+function resetPairButton(label = 'Generate Pairing Code ↗') { pairButton.disabled = false; pairButton.textContent = label; }
+function showPairCode(code) {
+  if (currentCode === code) return;
+  currentCode = code; pairCode.textContent = code; pairCodeWrap.hidden = false;
+  showStatus('Pairing code generated. Enter it in WhatsApp Linked devices. Waiting for WhatsApp to confirm…');
+  resetPairButton();
+}
+async function readJson(response) { try { return await response.json(); } catch { return {}; } }
 form?.addEventListener('submit', async event => {
   event.preventDefault();
   if (statusPoll) clearInterval(statusPoll);
@@ -29,22 +38,23 @@ form?.addEventListener('submit', async event => {
   showStatus('Contacting the WhatsApp pairing service…');
   try {
     const response = await fetch('/api/pair-code', { method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify({ phone }) });
-    const data = await response.json();
+    const data = await readJson(response);
     if (!response.ok) throw new Error(data.error || 'Pairing request failed.');
-    if (data.code) { currentCode = data.code; pairCode.textContent = data.code; pairCodeWrap.hidden = false; showStatus('Pairing code generated. Enter it in WhatsApp Linked devices.'); pairButton.disabled = false; pairButton.textContent = 'Generate Pairing Code ↗'; return; }
+    if (data.code) showPairCode(data.code);
+    else showStatus(data.message || 'Pairing request started. Waiting for the code…');
     let attempts = 0;
-    showStatus(data.message || 'Pairing request started. Waiting for the code…');
     statusPoll = setInterval(async () => {
       attempts++;
       try {
         const statusResponse = await fetch(`/api/pair-code/status?token=${encodeURIComponent(data.pairingToken || '')}`, { cache: 'no-store' });
-        const state = await statusResponse.json();
+        const state = await readJson(statusResponse);
         if (!statusResponse.ok) throw new Error(state.error || 'Pairing status check failed.');
-        if (state.code) { currentCode = state.code; pairCode.textContent = state.code; pairCodeWrap.hidden = false; showStatus('Pairing code generated. Enter it in WhatsApp Linked devices.'); clearInterval(statusPoll); pairButton.disabled = false; pairButton.textContent = 'Generate Pairing Code ↗'; }
-        else if (state.status === 'connection_lost' || attempts >= 120) { clearInterval(statusPoll); showStatus('Pairing did not complete. Check service logs and try again.', true); pairButton.disabled = false; pairButton.textContent = 'Try again ↗'; }
-      } catch (error) { clearInterval(statusPoll); showStatus(error.message, true); pairButton.disabled = false; pairButton.textContent = 'Try again ↗'; }
+        if (state.connected || state.status === 'connected') { clearInterval(statusPoll); pairCodeWrap.hidden = true; currentCode = ''; showStatus('WhatsApp connected successfully.'); resetPairButton(); return; }
+        if (state.code) showPairCode(state.code);
+        if (FAILED_STATES[state.status] || attempts >= 480) { clearInterval(statusPoll); pairCodeWrap.hidden = true; currentCode = ''; showStatus(FAILED_STATES[state.status] || 'Pairing did not complete. Check service logs and try again.', true); resetPairButton('Try again ↗'); }
+      } catch (error) { clearInterval(statusPoll); showStatus(error.message, true); resetPairButton('Try again ↗'); }
     }, 1500);
-  } catch (error) { showStatus(error.message, true); pairButton.disabled = false; pairButton.textContent = 'Try again ↗'; }
+  } catch (error) { showStatus(error.message, true); resetPairButton('Try again ↗'); }
 });
 copyButton?.addEventListener('click', async () => {
   if (!currentCode) return;

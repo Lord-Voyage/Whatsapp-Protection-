@@ -3,12 +3,14 @@
 ## Required service configuration
 
 - Runtime: Docker Web Service
-- Node.js: 20 (inside Docker image)
+- Node.js: 22 LTS (inside Docker image)
 - Persistent disk: mount at `/data`
 - `DATA_DIR=/data`
-- `PORT=3000`
+- `PORT`: set automatically by Render (defaults to 3000 locally)
 - `OWNER_NUMBER`: bot owner's WhatsApp number, international digits only
 - `NODE_ENV=production`
+- Optional: `LOG_LEVEL`, `BAILEYS_LOG_LEVEL`, `MAX_LINKED_ACCOUNTS` (see `.env.example`)
+- Instance type: a paid plan (e.g. Starter); persistent disks are not available on the free plan
 
 
 ## Deploy
@@ -42,6 +44,6 @@ Do not deploy the Baileys process as a Vercel serverless function. The bot needs
 
 ## Dashboard and administration
 
-`/dashboard` is a public, read-only service status page. It does not expose activity logs, protection toggles, session controls, or private owner information. The configured owner and successfully paired users manage their own protections by sending `/activate ban_protection`, `/activate bug_protection`, and `/activate soam_protection` from the configured owner WhatsApp account. No `ADMIN_TOKEN` is required.
+`/dashboard` is a public, read-only service status page. It does not expose activity logs, protection toggles, session controls, or private owner information. The configured owner and successfully paired users manage their own protections by sending `/activate <feature>`, `/deactivate <feature>` and `/status` (features: `ban_protection`, `bug_protection`, `soam_protection`). The owner uses the bot account's "Message yourself" chat; linked users message the bot privately. No `ADMIN_TOKEN` is required.
 
-To replace an already registered WhatsApp session, stop the service, remove the contents of `DATA_DIR/auth` from the persistent disk using the host's private shell/file tools, then restart and pair again. Never expose or share the auth directory.
+To replace an already registered WhatsApp session, stop the service, remove the contents of `DATA_DIR/auth` from the persistent disk using the host's private shell/file tools, then restart and pair again. Never expose or share the auth directory. Linked accounts live in `DATA_DIR/auth/linked/<phone>`; keep that folder if you only want to re-pair the primary account.

@@ -2,7 +2,9 @@ services:
   - type: web
     name: whatsapp-protection
     runtime: docker
+    # Persistent disks require a paid instance type.
     plan: starter
+    dockerfilePath: ./Dockerfile
     healthCheckPath: /api/health
     envVars:
       - key: NODE_ENV
@@ -11,6 +13,10 @@ services:
         value: /data
       - key: OWNER_NUMBER
         sync: false
+      - key: LOG_LEVEL
+        value: info
+      - key: BAILEYS_LOG_LEVEL
+        value: warn
     disk:
       name: whatsapp-protection-data
       mountPath: /data
