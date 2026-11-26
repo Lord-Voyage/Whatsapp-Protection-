@@ -9,7 +9,7 @@
 - `PORT`: set automatically by Render (defaults to 3000 locally)
 - `OWNER_NUMBER` (optional, recommended): bot owner's WhatsApp number, international digits only. If unset, the first number paired on the website becomes the primary bot account.
 - `NODE_ENV=production`
-- Optional: `LOG_LEVEL`, `BAILEYS_LOG_LEVEL`, `MAX_LINKED_ACCOUNTS`, `INTERACTIVE_BUTTONS` (see `.env.example`)
+- Optional: `LOG_LEVEL`, `BAILEYS_LOG_LEVEL`, `MAX_LINKED_ACCOUNTS`, `INTERACTIVE_BUTTONS`, `CHANNEL_JID`, `CHANNEL_NAME` (see `.env.example`)
 - Instance type: a paid plan (e.g. Starter); persistent disks are not available on the free plan
 
 

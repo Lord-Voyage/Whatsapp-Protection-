@@ -51,7 +51,7 @@ form?.addEventListener('submit', async event => {
         const statusResponse = await fetch(`/api/pair-code/status?token=${encodeURIComponent(data.pairingToken || '')}`, { cache: 'no-store' });
         const state = await readJson(statusResponse);
         if (!statusResponse.ok) throw new Error(state.error || 'Pairing status check failed.');
-        if (state.connected || state.status === 'connected') { clearInterval(statusPoll); pairCodeWrap.hidden = true; currentCode = ''; showStatus('WhatsApp connected successfully. Send /menu in your WhatsApp “Message yourself” chat to use the bot.'); resetPairButton(); return; }
+        if (state.connected || state.status === 'connected') { clearInterval(statusPoll); pairCodeWrap.hidden = true; currentCode = ''; showStatus('WhatsApp connected successfully. Send /menu from your WhatsApp in any chat or group to use the bot.'); resetPairButton(); return; }
         if (state.code) showPairCode(state.code);
         if (FAILED_STATES[state.status] || attempts >= 480) { clearInterval(statusPoll); pairCodeWrap.hidden = true; currentCode = ''; showStatus(FAILED_STATES[state.status] || 'Pairing did not complete. Check service logs and try again.', true); resetPairButton('Try again ↗'); }
       } catch (error) { clearInterval(statusPoll); showStatus(error.message, true); resetPairButton('Try again ↗'); }
