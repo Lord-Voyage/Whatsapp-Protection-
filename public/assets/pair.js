@@ -20,8 +20,10 @@ function resetButton(label = 'Generate Pairing Code ↗') { button.disabled = fa
 function stopPolling() { if (pollTimer) clearInterval(pollTimer); pollTimer = null; }
 function showCode(code) {
   if (activeCode === code) return;
+  const refreshed = Boolean(activeCode);
   activeCode = code;
   codeNode.textContent = code;
+  if (refreshed) { codeWrap.hidden = false; status('WhatsApp expired the previous code, so a new one was issued. Enter this new code in WhatsApp.'); return; }
   codeWrap.hidden = false;
   status('Pairing code ready. Enter it in WhatsApp Linked devices. Waiting for WhatsApp to confirm…');
   resetButton();

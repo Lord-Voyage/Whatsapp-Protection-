@@ -10,7 +10,7 @@ WhatsApp Protection is a persistent Node.js service with an Express website, Bai
 - SQLite storage for linked numbers, protection settings, pairing history, activity logs and security events.
 - Baileys multi-file authentication under `DATA_DIR/auth` for the primary owner and `DATA_DIR/auth/linked/<phone>` for each additional linked account.
 - WhatsApp commands: `/pair`, `/menu`, `/developers`, `/status`, `/activate <feature>` and `/deactivate <feature>` where `<feature>` is `ban_protection`, `bug_protection` or `soam_protection`. Settings are stored per phone number in SQLite. Every paired number (owner or linked) sends commands from its own WhatsApp "Message yourself" chat and gets the reply there from its own session; linked users can also message the primary bot in a private chat. Messages other people send to a paired number are never treated as commands.
-- Pairing: sessions use a standard Baileys browser identity (`Browsers.macOS('Chrome')`) and the live WhatsApp Web version, and the pairing socket stays open for the whole 10-minute code lifetime so a late code entry still links.
+- Pairing: sessions use a standard Baileys browser identity (`Browsers.macOS('Chrome')`) and the live WhatsApp Web version, and the live WhatsApp Web version. WhatsApp's server ends an unlinked pairing connection after about 3.5 minutes, so until the 10-minute pairing deadline the service requests a fresh genuine code; the website shows it automatically and `/pair` users get it in the chat.
 - Native-flow menu with image header, quick replies and a WhatsApp Channel URL button. Native message rendering depends on WhatsApp client compatibility and must be verified with a linked account.
 - Developer contact buttons for Lord Voyage and Calvin The Great.
 

@@ -243,3 +243,10 @@ test('sessions use a standard browser identity and stay open for the whole pairi
   assert.ok(testing.PAIRING_QR_REF_MS * 5 >= 10 * 60_000, 'Baileys pairing refs must cover the 10-minute code lifetime');
   assert.deepEqual(opts.version, [2, 3000, 1]);
 });
+
+test('pairing codes are refreshed only before the pairing deadline', () => {
+  const now = Date.now();
+  assert.equal(testing.pairingRefreshAllowed(now + 5 * 60_000, now), true);
+  assert.equal(testing.pairingRefreshAllowed(now + 10_000, now), false, 'no refresh right before the deadline');
+  assert.equal(testing.pairingRefreshAllowed(0, now), false);
+});

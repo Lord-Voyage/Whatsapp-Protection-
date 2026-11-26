@@ -77,6 +77,7 @@ let primaryPairingCode = null;
 let primaryPairingToken = null;
 let primaryPairingTokenExpires = 0;
 let primaryPairingTimer = null;
+let primaryPairingDeadline = 0;
 const channelFollowInFlight = new Set();
 const linkedSessions = new Map();
 const linkedStartPromises = new Map();
@@ -91,6 +92,10 @@ const blockedSenders = new Map();
 const outboundQueues = new Map();
 const PAIRING_TOKEN_TTL = 10 * 60 * 1000;
 const PAIRING_QR_REF_MS = 2 * 60 * 1000;
+// WhatsApp's server ends an unlinked pairing connection after roughly 3.5 minutes (status 428),
+// which invalidates its code. Until the pairing deadline, a fresh genuine code is requested.
+const PAIRING_REFRESH_MARGIN_MS = 30_000;
+function pairingRefreshAllowed(deadline, now = Date.now()) { return Boolean(deadline) && now < deadline - PAIRING_REFRESH_MARGIN_MS; }
 const LINKED_AUTH_DIR = path.join(AUTH_DIR, 'linked');
 const CHANNEL_CODE = '0029Vb84TTB1SWt2Fvyhtu2D';
 fs.mkdirSync(LINKED_AUTH_DIR, { recursive: true });
@@ -411,6 +416,15 @@ function waitForPairingChallenge(activeSock, timeoutMs = 30_000) {
   return ready;
 }
 
+function refreshLinkedPairing(phone, record, statusCode) {
+  clearTimeout(record.expiryTimer);
+  record.code = null;
+  fs.rmSync(path.join(LINKED_AUTH_DIR, phone), { recursive: true, force: true });
+  insertPairEvent.run(phone, 'pairing_code_refreshing', `WhatsApp closed the unlinked pairing connection; status ${statusCode ?? 'unknown'}`);
+  startLinkedSession(phone, { requestCode: true, pairingDeadline: record.pairingDeadline, onCode: record.onCode, refresh: true })
+    .catch(error => safeLogError(error, 'Pairing code refresh failed', phone));
+}
+
 function cleanupLinkedPairing(phone, record, reason) {
   record.intentionalClose = true;
   record.status = 'expired';
@@ -428,7 +442,7 @@ function cleanupLinkedPairing(phone, record, reason) {
   } catch (error) { log.warn({ err: error, phone }, 'Could not record pairing cleanup'); }
 }
 
-async function startLinkedSessionInternal(phone, { requestCode = false } = {}) {
+async function startLinkedSessionInternal(phone, { requestCode = false, pairingDeadline = 0, onCode = null, refresh = false } = {}) {
   const existing = linkedSessions.get(phone);
   if (existing?.socket && ['pairing', 'connected', 'connecting'].includes(existing.status)) {
     if (existing.code && existing.codeExpiresAt > Date.now()) return existing.code;
@@ -505,6 +519,10 @@ async function startLinkedSessionInternal(phone, { requestCode = false } = {}) {
           return;
         }
         if (!canReconnect) {
+          if (record.status === 'pairing' && record.code && pairingRefreshAllowed(record.pairingDeadline)) {
+            refreshLinkedPairing(phone, record, code);
+            return;
+          }
           cleanupLinkedPairing(phone, record, `Pairing ended before the device was linked; status ${code ?? 'unknown'}`);
           return;
         }
@@ -531,15 +549,18 @@ async function startLinkedSessionInternal(phone, { requestCode = false } = {}) {
       if (record.socket !== activeSock) throw new Error('WhatsApp disconnected before the device-linking code was ready. Send /pair again.');
       const code = await activeSock.requestPairingCode(phone);
       if (record.socket !== activeSock || !['pairing', 'connecting'].includes(record.status)) throw new Error('WhatsApp disconnected before the device-linking code was ready. Send /pair again.');
-      record.code = code; record.codeExpiresAt = Date.now() + PAIRING_TOKEN_TTL; record.status = 'pairing';
+      record.pairingDeadline = pairingDeadline || Date.now() + PAIRING_TOKEN_TTL;
+      record.onCode = onCode;
+      record.code = code; record.codeExpiresAt = record.pairingDeadline; record.status = 'pairing';
       record.expiryTimer = setTimeout(() => {
         if (linkedSessions.get(phone) === record && record.status !== 'connected') cleanupLinkedPairing(phone, record, 'Pairing code expired before the device was linked');
-      }, PAIRING_TOKEN_TTL);
+      }, Math.max(1000, record.pairingDeadline - Date.now()));
       record.expiryTimer.unref?.();
       upsertLinkedDevice.run(phone, 'pending', 'pairing_code_issued');
       setPair.run(phone, 'pairing');
-      insertPairEvent.run(phone, 'pairing_code_generated', 'Genuine Baileys requestPairingCode result');
+      insertPairEvent.run(phone, refresh ? 'pairing_code_refreshed' : 'pairing_code_generated', 'Genuine Baileys requestPairingCode result');
       insertLog.run(phone, 'pairing_code_generated', 'Device-linking code generated');
+      if (refresh && onCode) Promise.resolve(onCode(code)).catch(error => safeLogError(error, 'Could not deliver refreshed pairing code', phone));
       return code;
     } catch (error) {
       cleanupLinkedPairing(phone, record, `Pairing code request failed: ${String(error?.message || error).slice(0, 200)}`);
@@ -564,7 +585,7 @@ async function startLinkedSession(phone, options = {}) {
   finally { linkedStartPromises.delete(phone); }
 }
 
-async function createLinkedPairing(phone) {
+async function createLinkedPairing(phone, { onCodeRefresh = null } = {}) {
   phone = normalizePhone(phone);
   const owner = getOwnerPhone();
   if (owner && phone === owner) throw new Error('The primary owner account is already connected to the main bot session.');
@@ -600,7 +621,7 @@ async function createLinkedPairing(phone) {
     fs.rmSync(authPath, { recursive: true, force: true });
   }
   upsertLinkedDevice.run(phone, 'pending', 'starting_pairing');
-  const code = await startLinkedSession(phone, { requestCode: true });
+  const code = await startLinkedSession(phone, { requestCode: true, onCode: onCodeRefresh });
   return { code, status: 'pairing' };
 }
 
@@ -655,7 +676,9 @@ async function handleCommand(msg, activeSock = sock) {
       return;
     }
     try {
-      const result = await createLinkedPairing(sender);
+      const result = await createLinkedPairing(sender, {
+        onCodeRefresh: newCode => sendBotPayload(jid, s => s.sendMessage(jid, { text: `WhatsApp expired the previous code. Your new device-linking code is:\n\n\`\`\`${newCode}\`\`\`` }), sender)
+      });
       if (result.code) {
         const reply = [
           '*WHATSAPP PROTECTION — DEVICE LINKING*',
@@ -665,7 +688,7 @@ async function handleCommand(msg, activeSock = sock) {
           '```' + result.code + '```',
           '',
           'On the same phone number, open WhatsApp → Linked devices → Link a device → Link with phone number, then enter this code.',
-          'Keep this code private. It is valid for 10 minutes.',
+          'Keep this code private. If WhatsApp expires it before you link, a new code is sent here automatically for up to 10 minutes.',
           '',
           'After the account connects, send /menu in your own "Message yourself" chat to use the bot.'
         ].join('\n');
@@ -791,6 +814,15 @@ async function startSocket(phoneForPairing = null, requestCode = false) {
           return;
         }
         if (!canReconnect) {
+          if (requestCode && phoneForPairing && primaryPairingCode && pairingRefreshAllowed(primaryPairingDeadline)) {
+            clearTimeout(primaryPairingTimer); primaryPairingTimer = null;
+            primaryPairingCode = null;
+            clearPrimaryAuth();
+            currentStatus = 'pairing';
+            insertPairEvent.run(phoneForPairing, 'primary_pairing_code_refreshing', `WhatsApp closed the unlinked pairing connection; status ${code ?? 'unknown'}`);
+            startSocket(phoneForPairing, true).catch(error => safeLogError(error, 'Primary pairing code refresh failed'));
+            return;
+          }
           endPrimaryPairing(null, 'pairing_expired', `Pairing ended before the device was linked; status ${code ?? 'unknown'}`);
           return;
         }
@@ -822,9 +854,10 @@ async function startSocket(phoneForPairing = null, requestCode = false) {
       primaryPairingCode = code;
       currentStatus = 'pairing';
       clearTimeout(primaryPairingTimer);
+      if (!primaryPairingDeadline || primaryPairingDeadline < Date.now()) primaryPairingDeadline = Date.now() + PAIRING_TOKEN_TTL;
       primaryPairingTimer = setTimeout(() => {
         if (sock === activeSock && currentStatus !== 'connected') endPrimaryPairing(activeSock, 'pairing_expired', 'Pairing code expired before the device was linked');
-      }, PAIRING_TOKEN_TTL);
+      }, Math.max(1000, primaryPairingDeadline - Date.now()));
       primaryPairingTimer.unref?.();
       setPair.run(phoneForPairing, 'pairing');
       insertPairEvent.run(phoneForPairing, 'primary_pairing_code_generated', 'Primary owner device-linking code generated');
@@ -926,6 +959,7 @@ async function requestPrimaryPairing(phone, res) {
     // The token outlives the code slightly so the page can still read the final status.
     primaryPairingTokenExpires = Date.now() + PAIRING_TOKEN_TTL + 2 * 60_000;
     primaryPairingCode = null;
+    primaryPairingDeadline = Date.now() + PAIRING_TOKEN_TTL;
     code = await startSocket(phone, true);
   } finally { primaryPairingStarting = false; }
   if (!code) return res.status(202).json({ status: currentStatus, pairingToken: primaryPairingToken, expiresInSeconds, message: 'Pairing started. Waiting for the code…' });
@@ -1028,7 +1062,7 @@ if (isMainModule) start();
 
 // Internal hooks used by the automated test suite (test/). Not part of the public HTTP API.
 export const testing = {
-  app, db, handleCommand, waitForPairingChallenge, replyContext, waSocketOptions, PAIRING_QR_REF_MS, linkedSessions, linkedPairingState, issueLinkedPairingToken, isPrimaryPairingRequest, resolveCommandSender, followChannelForPrimaryAccount, followChannelForLinkedAccount, featureEnabled,
+  app, db, handleCommand, waitForPairingChallenge, pairingRefreshAllowed, replyContext, waSocketOptions, PAIRING_QR_REF_MS, linkedSessions, linkedPairingState, issueLinkedPairingToken, isPrimaryPairingRequest, resolveCommandSender, followChannelForPrimaryAccount, followChannelForLinkedAccount, featureEnabled,
   setPrimarySocket(activeSock, status = 'connected') { sock = activeSock; currentStatus = status; if (activeSock?.user?.id) currentPhone = phoneFromJid(activeSock.user.id); },
   CHANNEL_CODE
 };
