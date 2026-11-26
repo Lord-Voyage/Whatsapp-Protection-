@@ -1,0 +1,17 @@
+services:
+  - type: web
+    name: whatsapp-protection
+    runtime: docker
+    plan: starter
+    healthCheckPath: /api/health
+    envVars:
+      - key: NODE_ENV
+        value: production
+      - key: DATA_DIR
+        value: /data
+      - key: OWNER_NUMBER
+        sync: false
+    disk:
+      name: whatsapp-protection-data
+      mountPath: /data
+      sizeGB: 1

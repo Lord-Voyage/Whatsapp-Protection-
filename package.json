@@ -1,0 +1,22 @@
+{
+  "name": "whatsapp-protection",
+  "version": "1.1.0",
+  "private": true,
+  "type": "module",
+  "description": "WhatsApp Protection pairing website and persistent Baileys bot service",
+  "scripts": {
+    "start": "node --env-file-if-exists=.env server.js",
+    "dev": "node --env-file-if-exists=.env --watch server.js",
+    "check": "node --check server.js && node --check public/assets/app.js && node --check public/assets/pair.js && node --check public/assets/dashboard.js"
+  },
+  "engines": {
+    "node": ">=20"
+  },
+  "dependencies": {
+    "@whiskeysockets/baileys": "7.0.0-rc.16",
+    "better-sqlite3": "11.8.1",
+    "express": "4.21.2",
+    "pino": "9.6.0",
+    "baileys_helper": "1.0.6"
+  }
+}
