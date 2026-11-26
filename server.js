@@ -537,7 +537,9 @@ async function createLinkedPairing(phone) {
   const current = linkedSessions.get(phone);
   const activeCount = countLinkedByStatus.get('active').count;
   const pendingCount = countLinkedByStatus.get('pending').count;
-  if (MAX_LINKED_ACCOUNTS && existing?.status !== 'active' && activeCount >= MAX_LINKED_ACCOUNTS) throw new Error(`This server has reached its configured limit of ${MAX_LINKED_ACCOUNTS} linked accounts (MAX_LINKED_ACCOUNTS).`);
+  // Pending pairings reserve a slot so concurrent requests cannot overshoot the cap.
+  const reservedCount = activeCount + pendingCount - (existing?.status === 'pending' ? 1 : 0);
+  if (MAX_LINKED_ACCOUNTS && existing?.status !== 'active' && reservedCount >= MAX_LINKED_ACCOUNTS) throw new Error(`This server has reached its configured limit of ${MAX_LINKED_ACCOUNTS} linked accounts (MAX_LINKED_ACCOUNTS).`);
   if (pendingCount >= 20 && existing?.status !== 'pending') throw new Error('The service is handling too many pending pairing requests. Try again later.');
   if (existing?.status === 'active' && current?.status === 'connected') {
     return { code: null, status: 'connected', message: 'This WhatsApp number is already paired and connected.' };
@@ -713,7 +715,6 @@ function endPrimaryPairing(activeSock, status, reason) {
 async function startSocket(phoneForPairing = null, requestCode = false) {
   if (sock || shuttingDown) throw new Error('A WhatsApp session is already active or starting.');
   manualDisconnect = false;
-  if (phoneForPairing) currentPhone = phoneForPairing;
   currentStatus = 'connecting';
   const { state, saveCreds } = await useMultiFileAuthState(AUTH_DIR);
   if (sock || shuttingDown) throw new Error('A WhatsApp session is already active or starting.');
@@ -722,6 +723,7 @@ async function startSocket(phoneForPairing = null, requestCode = false) {
   const activeSock = makeWASocket({ auth: state, ...(version ? { version } : {}), printQRInTerminal: false, logger: waLogger, browser: ['WhatsApp Protection', 'Chrome', '1.0.0'], markOnlineOnConnect: false, syncFullHistory: false });
   const pairingReady = requestCode && !state.creds.registered ? waitForPairingChallenge(activeSock) : null;
   sock = activeSock;
+  if (phoneForPairing) currentPhone = phoneForPairing;
   activeSock.ev.on('creds.update', saveCreds);
   activeSock.ev.on('connection.update', async update => {
     try {
@@ -838,34 +840,88 @@ app.get('/api/health', (_req, res) => {
   res.status(database ? 200 : 503).json({ ok: database, service: 'whatsapp-protection', status: currentStatus, database });
 });
 app.get('/api/status', (_req, res) => res.json({ status: currentStatus, connected: currentStatus === 'connected' }));
-// Website bootstrap pairing is restricted to OWNER_NUMBER. Additional accounts must
-// initiate /pair from their own private WhatsApp chat to prove control of that number.
-app.post('/api/pair-code', pairCodeRequestLimit, async (req, res) => {
+// Website pairing. The primary bot account is paired first: either OWNER_NUMBER, or, when
+// OWNER_NUMBER is unset, the first number submitted while no primary session exists. Every
+// other number gets its own independent linked-device session (same as the /pair command).
+// Codes always come from Baileys requestPairingCode; the short-lived pairingToken only lets
+// the requesting browser poll for that one request's status.
+const linkedPairingTokens = new Map();
+function issueLinkedPairingToken(phone) {
+  const now = Date.now();
+  for (const [token, entry] of linkedPairingTokens) if (entry.expires < now) linkedPairingTokens.delete(token);
+  const token = crypto.randomBytes(24).toString('hex');
+  linkedPairingTokens.set(token, { phone, expires: now + PAIRING_TOKEN_TTL + 2 * 60_000 });
+  return token;
+}
+function linkedPairingState(phone) {
+  const record = linkedSessions.get(phone);
+  if (record) {
+    if (record.status === 'connected') return { code: null, status: 'connected', connected: true };
+    if (record.status === 'pairing') return { code: record.code && record.codeExpiresAt > Date.now() ? record.code : null, status: 'pairing', connected: false };
+    // connection_lost/connecting here is WhatsApp's normal restart right after the code is accepted.
+    if (['connecting', 'connection_lost'].includes(record.status)) return { code: null, status: 'connecting', connected: false };
+    if (record.status === 'revoked') return { code: null, status: 'logged_out', connected: false };
+  }
+  return getLinkedDevice.get(phone)?.status === 'active'
+    ? { code: null, status: 'connecting', connected: false }
+    : { code: null, status: 'pairing_expired', connected: false };
+}
+function isPrimaryPairingRequest(phone) {
+  const configuredOwner = String(process.env.OWNER_NUMBER || '').replace(/\D/g, '');
+  if (configuredOwner) return phone === configuredOwner;
+  if (currentPhone && phone === currentPhone) return true;
+  return !sock && currentStatus !== 'connected' && !isRegisteredCredsFile(path.join(AUTH_DIR, 'creds.json')) && getLinkedDevice.get(phone)?.status !== 'active';
+}
+let primaryPairingStarting = false;
+let primaryPairingPhone = null;
+async function requestPrimaryPairing(phone, res) {
+  const expiresInSeconds = PAIRING_TOKEN_TTL / 1000;
+  if (currentStatus === 'connected') return res.status(409).json({ error: 'This number is already connected as the primary bot account.' });
+  if (primaryPairingStarting) return res.status(409).json({ error: 'The primary WhatsApp session is already connecting. Wait a moment and try again.' });
+  if (sock) {
+    if (primaryPairingPhone === phone && currentPhone === phone && primaryPairingToken && Date.now() < primaryPairingTokenExpires) return res.json({ status: currentStatus, pairingToken: primaryPairingToken, code: primaryPairingCode, expiresInSeconds });
+    return res.status(409).json({ error: 'The primary WhatsApp session is already connecting. Wait a moment and try again.' });
+  }
+  if (isRegisteredCredsFile(path.join(AUTH_DIR, 'creds.json'))) return res.status(409).json({ error: 'The primary WhatsApp account is already registered. Restore its saved session or securely reset DATA_DIR/auth to pair again.' });
+  primaryPairingStarting = true;
+  let code;
   try {
-    if (!process.env.OWNER_NUMBER) return res.status(503).json({ error: 'Set OWNER_NUMBER in the service environment before pairing the primary bot account.' });
-    const phone = normalizePhone(req.body?.phone);
-    const owner = normalizePhone(process.env.OWNER_NUMBER);
-    if (phone !== owner) return res.status(403).json({ error: 'Website pairing is only for the configured primary owner. Other users must send /pair in a private WhatsApp chat with the bot.' });
-    if (sock || currentStatus === 'connected') return res.status(409).json({ error: 'The primary WhatsApp session is already active or connecting.' });
-    const credsPath = path.join(AUTH_DIR, 'creds.json');
-    if (isRegisteredCredsFile(credsPath)) return res.status(409).json({ error: 'The primary WhatsApp account is already registered. Restore its saved session or securely reset DATA_DIR/auth to pair again.' });
     primaryPairingToken = crypto.randomBytes(24).toString('hex');
+    primaryPairingPhone = phone;
     // The token outlives the code slightly so the page can still read the final status.
     primaryPairingTokenExpires = Date.now() + PAIRING_TOKEN_TTL + 2 * 60_000;
     primaryPairingCode = null;
-    const code = await startSocket(phone, true);
-    const expiresInSeconds = PAIRING_TOKEN_TTL / 1000;
-    if (!code) return res.status(202).json({ status: currentStatus, pairingToken: primaryPairingToken, expiresInSeconds, message: 'Pairing started. Waiting for the code…' });
-    res.json({ status: currentStatus, pairingToken: primaryPairingToken, code, expiresInSeconds });
+    code = await startSocket(phone, true);
+  } finally { primaryPairingStarting = false; }
+  if (!code) return res.status(202).json({ status: currentStatus, pairingToken: primaryPairingToken, expiresInSeconds, message: 'Pairing started. Waiting for the code…' });
+  res.json({ status: currentStatus, pairingToken: primaryPairingToken, code, expiresInSeconds });
+}
+app.post('/api/pair-code', pairCodeRequestLimit, async (req, res) => {
+  let phone = '';
+  try {
+    phone = normalizePhone(req.body?.phone);
   } catch (error) {
-    safeLogError(error, 'Primary owner pairing request failed');
-    res.status(502).json({ error: error.message || 'Could not generate a primary device-linking code.' });
+    return res.status(400).json({ error: error.message });
+  }
+  try {
+    if (isPrimaryPairingRequest(phone)) return await requestPrimaryPairing(phone, res);
+    const result = await createLinkedPairing(phone);
+    if (!result.code) {
+      const connected = result.status === 'connected';
+      return res.json({ status: result.status || 'connected', connected, message: result.message, ...(connected ? {} : { pairingToken: issueLinkedPairingToken(phone) }) });
+    }
+    res.json({ status: 'pairing', pairingToken: issueLinkedPairingToken(phone), code: result.code, expiresInSeconds: PAIRING_TOKEN_TTL / 1000 });
+  } catch (error) {
+    safeLogError(error, 'Website pairing request failed', phone);
+    res.status(502).json({ error: error.message || 'Could not generate a device-linking code.' });
   }
 });
 app.get('/api/pair-code/status', pairStatusLimit, (req, res) => {
   const token = String(req.query.token || '');
-  if (!token || token !== primaryPairingToken || Date.now() > primaryPairingTokenExpires) return res.status(403).json({ error: 'Invalid or expired pairing request token.' });
   res.set('Cache-Control', 'no-store');
+  const linked = token && linkedPairingTokens.get(token);
+  if (linked && Date.now() <= linked.expires) return res.json(linkedPairingState(linked.phone));
+  if (!token || token !== primaryPairingToken || Date.now() > primaryPairingTokenExpires) return res.status(403).json({ error: 'Invalid or expired pairing request token.' });
   res.json({ code: primaryPairingCode, status: currentStatus, connected: currentStatus === 'connected' });
 });
 app.use('/api', (_req, res) => res.status(404).json({ error: 'Not found' }));
@@ -937,7 +993,7 @@ if (isMainModule) start();
 
 // Internal hooks used by the automated test suite (test/). Not part of the public HTTP API.
 export const testing = {
-  app, db, handleCommand, waitForPairingChallenge, resolveCommandSender, followChannelForPrimaryAccount, followChannelForLinkedAccount, featureEnabled,
+  app, db, handleCommand, waitForPairingChallenge, linkedSessions, linkedPairingState, issueLinkedPairingToken, isPrimaryPairingRequest, resolveCommandSender, followChannelForPrimaryAccount, followChannelForLinkedAccount, featureEnabled,
   setPrimarySocket(activeSock, status = 'connected') { sock = activeSock; currentStatus = status; if (activeSock?.user?.id) currentPhone = phoneFromJid(activeSock.user.id); },
   CHANNEL_CODE
 };

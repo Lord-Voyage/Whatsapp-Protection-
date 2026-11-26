@@ -63,13 +63,44 @@ test('HTTP routing: pages, missing assets and unknown API routes', async () => {
   assert.match(csp, /fonts\.googleapis\.com/); assert.match(csp, /fonts\.gstatic\.com/);
 });
 
-test('POST /api/pair-code only accepts the configured owner and rejects bad input', async () => {
-  const other = await fetch(`${base}/api/pair-code`, { method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify({ phone: STRANGER }) });
-  assert.equal(other.status, 403);
-  const bad = await fetch(`${base}/api/pair-code`, { method: 'POST', headers: { 'content-type': 'application/json' }, body: '{oops' });
+test('POST /api/pair-code validates input and refuses to re-pair a connected primary', async () => {
+  const post = body => fetch(`${base}/api/pair-code`, { method: 'POST', headers: { 'content-type': 'application/json' }, body });
+  const bad = await post('{oops');
   assert.equal(bad.status, 400); assert.ok((await bad.json()).error);
-  const status = await fetch(`${base}/api/pair-code/status?token=wrong`);
-  assert.equal(status.status, 403);
+  const short = await post(JSON.stringify({ phone: '123' }));
+  assert.equal(short.status, 400); assert.match((await short.json()).error, /valid international phone number/);
+  setPrimarySocket(fakeSocket());
+  const owner = await post(JSON.stringify({ phone: `+${OWNER}` }));
+  assert.equal(owner.status, 409);
+  assert.doesNotMatch((await owner.json()).error, /OWNER_NUMBER/);
+  assert.equal((await fetch(`${base}/api/pair-code/status?token=wrong`)).status, 403);
+});
+
+test('website pairing routes the owner to the primary session and everyone else to linked sessions', () => {
+  assert.equal(testing.isPrimaryPairingRequest(OWNER), true);
+  assert.equal(testing.isPrimaryPairingRequest(STRANGER), false);
+  const saved = process.env.OWNER_NUMBER;
+  try {
+    delete process.env.OWNER_NUMBER;
+    assert.equal(testing.isPrimaryPairingRequest(OWNER), true, 'the connected primary number stays primary');
+    assert.equal(testing.isPrimaryPairingRequest(STRANGER), false, 'a primary session already exists, so others get linked sessions');
+  } finally { process.env.OWNER_NUMBER = saved; }
+});
+
+test('linked pairing status is readable only with its token and follows the session lifecycle', async () => {
+  const phone = '256700000077';
+  const token = testing.issueLinkedPairingToken(phone);
+  const status = async () => (await fetch(`${base}/api/pair-code/status?token=${token}`)).json();
+  assert.equal((await status()).status, 'pairing_expired');
+  const record = { status: 'pairing', code: 'ABCD1234', codeExpiresAt: Date.now() + 60_000 };
+  testing.linkedSessions.set(phone, record);
+  assert.deepEqual(await status(), { code: 'ABCD1234', status: 'pairing', connected: false });
+  record.status = 'connection_lost'; record.code = null;
+  assert.equal((await status()).status, 'connecting', 'post-pairing restart is not reported as a failure');
+  record.status = 'connected';
+  assert.deepEqual(await status(), { code: null, status: 'connected', connected: true });
+  testing.linkedSessions.delete(phone);
+  assert.equal((await fetch(`${base}/api/pair-code/status?token=other`)).status, 403);
 });
 
 test('primary channel follow stores state, avoids duplicates and survives failures', async () => {
@@ -182,7 +213,7 @@ test('pairing status polling is not throttled by the code-request limit', async 
   for (let i = 0; i < 12; i += 1) assert.equal((await fetch(`${base}/api/pair-code/status?token=wrong`)).status, 403);
   let limited = false;
   for (let i = 0; i < 6; i += 1) {
-    const res = await fetch(`${base}/api/pair-code`, { method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify({ phone: STRANGER }) });
+    const res = await fetch(`${base}/api/pair-code`, { method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify({ phone: '1' }) });
     if (res.status === 429) limited = true;
   }
   assert.ok(limited, 'code requests are still rate limited');

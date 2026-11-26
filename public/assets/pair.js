@@ -56,6 +56,7 @@ form?.addEventListener('submit', async event => {
     const data = await readJson(response);
     if (!response.ok) throw new Error(data.error || 'Pairing request failed.');
     pairingToken = data.pairingToken || '';
+    if (data.connected) { status(data.message || 'This WhatsApp number is already connected.'); resetButton(); return; }
     if (data.code) showCode(data.code);
     else status(data.message || 'Pairing started. Waiting for Baileys to return the code…');
     startPolling();

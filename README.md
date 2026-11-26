@@ -29,12 +29,12 @@ SOAM means monitoring the bot against spam, suspicious activity, account abuse a
 Requirements: Node.js 20.19 or newer (22 LTS recommended, same as the Docker image), npm, and a WhatsApp account you own or are authorized to link.
 
 1. Copy `.env.example` to `.env`.
-2. Set `OWNER_NUMBER` to the primary bot owner's WhatsApp number in international digits-only format. The website bootstrap pairing endpoint accepts only this number. Additional users must send `/pair` from their own private WhatsApp chat.
+2. Optionally set `OWNER_NUMBER` (international digits only) to reserve the primary bot account for that number. If it is unset, the first number paired on the website becomes the primary bot account and owner. Every other number submitted on the website (or sending `/pair` to the bot privately) gets its own independent linked-device session.
 3. Run `npm ci`.
 4. Run `npm run check` (syntax) and `npm test` (server, database, pairing-authorization and command tests).
 5. Run `npm start` and open `http://localhost:3000`.
 
-All environment variables are documented in `.env.example`. Only `OWNER_NUMBER` needs a value; there is no admin token or activation key.
+All environment variables are documented in `.env.example`. None are required; there is no admin token or activation key.
 
 SQLite is created at `DATA_DIR/whatsapp-protection.sqlite`; Baileys credentials are stored at `DATA_DIR/auth`. Never publish or commit this directory.
 
@@ -43,7 +43,7 @@ SQLite is created at `DATA_DIR/whatsapp-protection.sqlite`; Baileys credentials 
 1. Push the project to a private Git repository.
 2. Create a Render Blueprint using `render.yaml`, or create a Docker Web Service.
 3. Keep the persistent disk mounted at `/data` (the blueprint provisions a 1 GB disk; Render disks need a paid instance type such as Starter). Render sets `PORT` itself; the server listens on it.
-4. Set `DATA_DIR=/data` and `OWNER_NUMBER` in the Render environment. The public pairing form only accepts the configured owner number; additional users must send /pair from their own private WhatsApp chat.
+4. Set `DATA_DIR=/data` in the Render environment, and optionally `OWNER_NUMBER` (recommended, so nobody else can claim the primary bot account before you pair it).
 5. Deploy and wait for `/api/health` to report `ok: true`.
 6. Open `/pair`, enter the configured owner number, and request the primary bot's pairing code. After the main bot is connected, each additional user sends `/pair` to the bot in a private chat.
 7. On the phone, open WhatsApp → Linked devices → Link a device → Link with phone number, then enter the displayed code.
@@ -56,8 +56,8 @@ Do not delete or replace the Render disk: it contains the Baileys session and SQ
 Public endpoints:
 - `GET /api/health` — service and database health indicator.
 - `GET /api/status` — coarse WhatsApp connection state.
-- `POST /api/pair-code` — primary-owner bootstrap only; body `{"phone":"OWNER_NUMBER"}`. Additional numbers cannot be paired through the public form.
-- `GET /api/pair-code/status?token=...` — retrieves the primary owner's code only for the matching unexpired pairing token.
+- `POST /api/pair-code` — body `{"phone":"<digits>"}`. Pairs the primary bot account (OWNER_NUMBER, or the first number when it is unset); any other number gets its own linked-device session. Returns a genuine Baileys code and a short-lived `pairingToken`.
+- `GET /api/pair-code/status?token=...` — returns the code and status (`pairing`, `connecting`, `connected`, `pairing_expired`) for that one pairing request.
 
 The dashboard is read-only. There are no public administrator endpoints. Protection changes are performed through WhatsApp commands by the configured owner or an active paired number.
 

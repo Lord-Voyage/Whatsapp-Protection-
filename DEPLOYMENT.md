@@ -7,7 +7,7 @@
 - Persistent disk: mount at `/data`
 - `DATA_DIR=/data`
 - `PORT`: set automatically by Render (defaults to 3000 locally)
-- `OWNER_NUMBER`: bot owner's WhatsApp number, international digits only
+- `OWNER_NUMBER` (optional, recommended): bot owner's WhatsApp number, international digits only. If unset, the first number paired on the website becomes the primary bot account.
 - `NODE_ENV=production`
 - Optional: `LOG_LEVEL`, `BAILEYS_LOG_LEVEL`, `MAX_LINKED_ACCOUNTS` (see `.env.example`)
 - Instance type: a paid plan (e.g. Starter); persistent disks are not available on the free plan
@@ -19,7 +19,7 @@
 2. In Render, create a Blueprint and select the repository, or create a Docker Web Service.
 3. Ensure the disk is mounted at `/data`. Do not use an ephemeral filesystem for Baileys credentials or SQLite.
 4. Deploy. Render health checks use `GET /api/health`.
-5. Visit `/pair`, submit only the configured `OWNER_NUMBER`, and wait for the primary bot's device-linking code. The copy button appears when the code is ready.
+5. Visit `/pair`, submit the owner number first, and wait for the primary bot's device-linking code. Other users can then pair their own numbers on the same page. The copy button appears when the code is ready.
 6. In WhatsApp, open Linked devices → Link a device → Link with phone number, and enter the code.
 7. Additional users send `/pair` to the bot from their own private WhatsApp chats. Each receives a genuine device-linking code in that same chat; after linking, that number is authorized to use bot commands.
 

@@ -40,6 +40,7 @@ form?.addEventListener('submit', async event => {
     const response = await fetch('/api/pair-code', { method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify({ phone }) });
     const data = await readJson(response);
     if (!response.ok) throw new Error(data.error || 'Pairing request failed.');
+    if (data.connected) { showStatus(data.message || 'This WhatsApp number is already connected.'); resetPairButton(); return; }
     if (data.code) showPairCode(data.code);
     else showStatus(data.message || 'Pairing request started. Waiting for the code…');
     let attempts = 0;
