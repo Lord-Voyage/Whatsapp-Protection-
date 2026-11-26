@@ -537,7 +537,9 @@ async function createLinkedPairing(phone) {
   const current = linkedSessions.get(phone);
   const activeCount = countLinkedByStatus.get('active').count;
   const pendingCount = countLinkedByStatus.get('pending').count;
-  if (MAX_LINKED_ACCOUNTS && existing?.status !== 'active' && activeCount >= MAX_LINKED_ACCOUNTS) throw new Error(`This server has reached its configured limit of ${MAX_LINKED_ACCOUNTS} linked accounts (MAX_LINKED_ACCOUNTS).`);
+  // Pending pairings reserve a slot so concurrent requests cannot overshoot the cap.
+  const reservedCount = activeCount + pendingCount - (existing?.status === 'pending' ? 1 : 0);
+  if (MAX_LINKED_ACCOUNTS && existing?.status !== 'active' && reservedCount >= MAX_LINKED_ACCOUNTS) throw new Error(`This server has reached its configured limit of ${MAX_LINKED_ACCOUNTS} linked accounts (MAX_LINKED_ACCOUNTS).`);
   if (pendingCount >= 20 && existing?.status !== 'pending') throw new Error('The service is handling too many pending pairing requests. Try again later.');
   if (existing?.status === 'active' && current?.status === 'connected') {
     return { code: null, status: 'connected', message: 'This WhatsApp number is already paired and connected.' };
