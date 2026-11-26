@@ -101,6 +101,11 @@ const CHANNEL_CODE = '0029Vb84TTB1SWt2Fvyhtu2D';
 fs.mkdirSync(LINKED_AUTH_DIR, { recursive: true });
 const CHANNEL_URL = 'https://whatsapp.com/channel/0029Vb84TTB1SWt2Fvyhtu2D';
 const MENU_IMAGE = path.join(__dirname, 'public', 'assets', 'logo.png');
+// WhatsApp often silently drops native-flow button messages sent from regular (non-Business API)
+// accounts, so the recipient sees no reply at all. Buttons are opt-in; by default every reply is a
+// standard text or image message that always renders.
+function interactiveButtonsEnabled() { return /^(1|true|yes|on)$/i.test(String(process.env.INTERACTIVE_BUTTONS || '')); }
+const unauthorizedNotices = new Map();
 
 function featureEnabled(feature, phone = getOwnerPhone()) {
   if (!phone) return false;
@@ -228,7 +233,10 @@ async function sendBrandedText(jid, title, body, buttons = [], phone = getOwnerP
     buttonParamsJson: JSON.stringify(button.url ? { display_text: button.label, url: button.url } : { display_text: button.label, id: button.id })
   }));
   const text = `*${title}*\n\n${body}`;
-  if (!nativeButtons.length) return sendBotPayload(jid, activeSock => activeSock.sendMessage(jid, { text }), phone);
+  if (!nativeButtons.length || !interactiveButtonsEnabled()) {
+    const links = buttons.filter(button => button.url).map(button => `${button.label}: ${button.url}`).join('\n');
+    return sendBotPayload(jid, activeSock => activeSock.sendMessage(jid, { text: links && !text.includes(links) ? `${text}\n\n${links}` : text }), phone);
+  }
   const payload = { interactiveMessage: {
     header: { title: 'WhatsApp Protection' },
     body: { text },
@@ -250,20 +258,34 @@ async function sendMenu(jid, phone) {
   const caption = [
     '*WHATSAPP PROTECTION*',
     '',
-    'Welcome. Use the options below to manage your connected bot.',
+    'Welcome. Send any command below to manage your connected bot.',
     '',
     '*COMMANDS*',
     '/pair',
     '/menu',
     '/developers',
+    '/status',
     '/activate ban_protection',
     '/activate bug_protection',
     '/activate soam_protection',
-    '/deactivate <feature>',
-    '/status',
+    '/deactivate ban_protection',
+    '/deactivate bug_protection',
+    '/deactivate soam_protection',
     '',
     'Independent security tooling. Not affiliated with WhatsApp or Meta.'
   ].join('\n');
+  if (!interactiveButtonsEnabled()) {
+    const fullCaption = `${caption}\n\nWhatsApp Channel: ${CHANNEL_URL}`;
+    await sendBotPayload(jid, async activeSock => {
+      try { return await activeSock.sendMessage(jid, { image: fs.readFileSync(MENU_IMAGE), caption: fullCaption }); }
+      catch (error) {
+        log.warn({ err: error }, 'Image menu failed; sending plain-text menu');
+        return activeSock.sendMessage(jid, { text: fullCaption });
+      }
+    }, phone);
+    insertLog.run(phone, 'command_menu', '/menu');
+    return;
+  }
   await sendBotPayload(jid, async activeSock => {
     try {
       const uploadedMedia = await prepareWAMessageMedia({ image: fs.readFileSync(MENU_IMAGE) }, { upload: activeSock.waUploadToServer });
@@ -706,6 +728,14 @@ async function handleCommand(msg, activeSock = sock) {
   const authorized = isOwner || Boolean(isLinkedAuthorized.get(sender));
   if (!authorized) {
     securityEvent(sender, 'medium', 'unauthorized_command_attempt', action.slice(0, 160), sender);
+    // Tell unpaired users how to get access instead of staying silent (private chats only,
+    // at most once per 10 minutes per number).
+    const now = Date.now();
+    if (!msg.key.fromMe && !msg.key.participant && !jid.endsWith('@g.us') && (unauthorizedNotices.get(sender) || 0) < now) {
+      unauthorizedNotices.set(sender, now + 10 * 60_000);
+      if (unauthorizedNotices.size > 3000) { for (const [key, until] of unauthorizedNotices) if (until < now) unauthorizedNotices.delete(key); }
+      await sendBotPayload(jid, s => s.sendMessage(jid, { text: 'This number is not paired with WhatsApp Protection yet, so commands are not available. Send /pair here (or pair on the website) to link your number; after it connects, send /menu in your own "Message yourself" chat.' }), sender);
+    }
     return;
   }
 
