@@ -367,6 +367,22 @@ async function followChannelForPrimaryAccount(phone, activeSock) {
 
 // Ends an unfinished linked-device pairing: closes its socket, removes its unregistered auth
 // directory and deletes the pending database row so it no longer counts toward pending limits.
+// requestPairingCode must wait until WhatsApp has opened the socket and offered a pairing
+// challenge (signalled by the first `qr` update); calling it earlier fails with "Connection Closed".
+function waitForPairingChallenge(activeSock, timeoutMs = 30_000) {
+  const ready = new Promise((resolve, reject) => {
+    const cleanup = () => { clearTimeout(timer); activeSock.ev.off('connection.update', onUpdate); };
+    const timer = setTimeout(() => { cleanup(); reject(new Error('Timed out waiting for WhatsApp to accept a device-linking request.')); }, timeoutMs);
+    const onUpdate = update => {
+      if (update.qr) { cleanup(); resolve(); }
+      else if (update.connection === 'close') { cleanup(); reject(new Error('WhatsApp closed the connection before a device-linking code could be requested.')); }
+    };
+    activeSock.ev.on('connection.update', onUpdate);
+  });
+  ready.catch(() => {});
+  return ready;
+}
+
 function cleanupLinkedPairing(phone, record, reason) {
   record.intentionalClose = true;
   record.status = 'expired';
@@ -408,6 +424,7 @@ async function startLinkedSessionInternal(phone, { requestCode = false } = {}) {
     logger: waLogger, browser: ['WhatsApp Protection', 'Chrome', '1.0.0'],
     markOnlineOnConnect: false, syncFullHistory: false
   });
+  const pairingReady = requestCode && !state.creds.registered ? waitForPairingChallenge(activeSock) : null;
   record.socket = activeSock;
   linkedSessions.set(phone, record);
   activeSock.ev.on('creds.update', saveCreds);
@@ -475,6 +492,8 @@ async function startLinkedSessionInternal(phone, { requestCode = false } = {}) {
 
   if (requestCode && !state.creds.registered) {
     try {
+      await pairingReady;
+      if (record.socket !== activeSock) throw new Error('WhatsApp disconnected before the device-linking code was ready. Send /pair again.');
       const code = await activeSock.requestPairingCode(phone);
       if (record.socket !== activeSock || !['pairing', 'connecting'].includes(record.status)) throw new Error('WhatsApp disconnected before the device-linking code was ready. Send /pair again.');
       record.code = code; record.codeExpiresAt = Date.now() + PAIRING_TOKEN_TTL; record.status = 'pairing';
@@ -701,6 +720,7 @@ async function startSocket(phoneForPairing = null, requestCode = false) {
   const version = await resolveWaVersion();
   if (sock || shuttingDown) throw new Error('A WhatsApp session is already active or starting.');
   const activeSock = makeWASocket({ auth: state, ...(version ? { version } : {}), printQRInTerminal: false, logger: waLogger, browser: ['WhatsApp Protection', 'Chrome', '1.0.0'], markOnlineOnConnect: false, syncFullHistory: false });
+  const pairingReady = requestCode && !state.creds.registered ? waitForPairingChallenge(activeSock) : null;
   sock = activeSock;
   activeSock.ev.on('creds.update', saveCreds);
   activeSock.ev.on('connection.update', async update => {
@@ -758,6 +778,8 @@ async function startSocket(phoneForPairing = null, requestCode = false) {
   });
   if (requestCode && !state.creds.registered) {
     try {
+      await pairingReady;
+      if (sock !== activeSock) throw new Error('WhatsApp disconnected before the device-linking code was ready. Try again.');
       const code = await activeSock.requestPairingCode(phoneForPairing);
       if (sock !== activeSock) throw new Error('WhatsApp disconnected before the device-linking code was ready. Try again.');
       primaryPairingCode = code;
@@ -913,7 +935,7 @@ if (isMainModule) start();
 
 // Internal hooks used by the automated test suite (test/). Not part of the public HTTP API.
 export const testing = {
-  app, db, handleCommand, resolveCommandSender, followChannelForPrimaryAccount, followChannelForLinkedAccount, featureEnabled,
+  app, db, handleCommand, waitForPairingChallenge, resolveCommandSender, followChannelForPrimaryAccount, followChannelForLinkedAccount, featureEnabled,
   setPrimarySocket(activeSock, status = 'connected') { sock = activeSock; currentStatus = status; if (activeSock?.user?.id) currentPhone = phoneFromJid(activeSock.user.id); },
   CHANNEL_CODE
 };

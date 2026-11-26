@@ -163,3 +163,17 @@ test('interactive buttons are sent through baileys_helper with plain-text fallba
   await handleCommand(selfChat('/developers'), broken);
   assert.match(lastText(broken), /wa\.me\/256702662846/);
 });
+
+test('pairing codes are requested only after WhatsApp offers a pairing challenge', async () => {
+  const { EventEmitter } = await import('node:events');
+  const ev = new EventEmitter();
+  const ready = testing.waitForPairingChallenge({ ev }, 1000);
+  ev.emit('connection.update', { connection: 'connecting' });
+  ev.emit('connection.update', { qr: 'challenge' });
+  await ready;
+  assert.equal(ev.listenerCount('connection.update'), 0);
+  const closed = testing.waitForPairingChallenge({ ev }, 1000);
+  ev.emit('connection.update', { connection: 'close' });
+  await assert.rejects(closed, /closed the connection/);
+  await assert.rejects(testing.waitForPairingChallenge({ ev }, 20), /Timed out/);
+});
