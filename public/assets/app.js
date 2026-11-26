@@ -22,8 +22,9 @@ const FAILED_STATES = { pairing_expired: 'The pairing code expired before the de
 function resetPairButton(label = 'Generate Pairing Code ↗') { pairButton.disabled = false; pairButton.textContent = label; }
 function showPairCode(code) {
   if (currentCode === code) return;
+  const refreshed = Boolean(currentCode);
   currentCode = code; pairCode.textContent = code; pairCodeWrap.hidden = false;
-  showStatus('Pairing code generated. Enter it in WhatsApp Linked devices. Waiting for WhatsApp to confirm…');
+  showStatus(refreshed ? 'WhatsApp expired the previous code, so a new one was issued. Enter this new code in WhatsApp.' : 'Pairing code generated. Enter it in WhatsApp Linked devices. Waiting for WhatsApp to confirm…');
   resetPairButton();
 }
 async function readJson(response) { try { return await response.json(); } catch { return {}; } }
