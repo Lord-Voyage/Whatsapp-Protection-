@@ -218,3 +218,28 @@ test('pairing status polling is not throttled by the code-request limit', async 
   }
   assert.ok(limited, 'code requests are still rate limited');
 });
+
+test('linked users command the bot from their own "Message yourself" chat and get replies on their own session', async () => {
+  const USER = '256700000044';
+  db.prepare("INSERT INTO linked_devices(phone,status,session_status) VALUES(?,?,?)").run(USER, 'active', 'connected');
+  const primary = fakeSocket(); setPrimarySocket(primary);
+  const linkedSock = { ...fakeSocket(), user: { id: `${USER}:3@s.whatsapp.net`, lid: '11223344:3@lid' } };
+  linkedSock.calls = { sent: [] };
+  linkedSock.sendMessage = async (jid, content) => { linkedSock.calls.sent.push({ jid, content }); return { key: { id: 'y' } }; };
+  const ctx = { socket: linkedSock, isOpen: () => true };
+  const own = { key: { remoteJid: `${USER}@s.whatsapp.net`, fromMe: true, id: 'own1' }, message: { conversation: '/status' } };
+  await testing.replyContext.run(ctx, () => testing.handleCommand(own, linkedSock));
+  assert.match(lastText(linkedSock), /PROTECTION STATUS[\s\S]*linked/);
+  assert.equal(primary.calls.sent.length, 0, 'the reply is not sent from the primary bot');
+  const before = linkedSock.calls.sent.length;
+  ctx.isOpen = () => false;
+  await testing.replyContext.run(ctx, () => testing.handleCommand({ ...own, key: { ...own.key, id: 'own2' } }, linkedSock));
+  assert.equal(linkedSock.calls.sent.length, before, 'nothing is sent through a closed linked session');
+});
+
+test('sessions use a standard browser identity and stay open for the whole pairing window', () => {
+  const opts = testing.waSocketOptions({}, [2, 3000, 1]);
+  assert.deepEqual(opts.browser, ['Mac OS', 'Chrome', '14.4.1']);
+  assert.ok(testing.PAIRING_QR_REF_MS * 5 >= 10 * 60_000, 'Baileys pairing refs must cover the 10-minute code lifetime');
+  assert.deepEqual(opts.version, [2, 3000, 1]);
+});
