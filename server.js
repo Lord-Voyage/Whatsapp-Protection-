@@ -7,7 +7,7 @@ import { fileURLToPath } from 'node:url';
 import { createRequire } from 'node:module';
 import Database from 'better-sqlite3';
 import pino from 'pino';
-import makeWASocket, { useMultiFileAuthState, DisconnectReason, Browsers, fetchLatestBaileysVersion, fetchLatestWaWebVersion, prepareWAMessageMedia } from '@whiskeysockets/baileys';
+import makeWASocket, { useMultiFileAuthState, DisconnectReason, Browsers, fetchLatestBaileysVersion, fetchLatestWaWebVersion, prepareWAMessageMedia, normalizeMessageContent } from '@whiskeysockets/baileys';
 
 const require = createRequire(import.meta.url);
 const { sendInteractiveMessage } = require('baileys_helper');
@@ -70,6 +70,19 @@ const setSystemConfig = db.prepare(`INSERT INTO system_config(key,value) VALUES(
 const deletePendingLinkedDevice = db.prepare(`DELETE FROM linked_devices WHERE phone=? AND status='pending'`);
 const countLinkedByStatus = db.prepare('SELECT COUNT(*) AS count FROM linked_devices WHERE status=?');
 const PROTECTION_FEATURES = ['ban_protection', 'bug_protection', 'soam_protection'];
+const COMMANDS = [
+  { command: '/pair', title: 'Pair this number', description: 'Link this number to the bot' },
+  { command: '/menu', title: 'Open the menu', description: 'Show available bot commands' },
+  { command: '/developers', title: 'Developer contacts', description: 'Show developer contact links' },
+  { command: '/status', title: 'Protection status', description: 'Check settings for this number' },
+  { command: '/activate ban_protection', title: 'Enable Ban Protection', description: 'Limit and queue bot replies' },
+  { command: '/activate bug_protection', title: 'Enable Bug Protection', description: 'Record errors and recover connections' },
+  { command: '/activate soam_protection', title: 'Enable SOAM Protection', description: 'Monitor abuse and command bursts' },
+  { command: '/deactivate ban_protection', title: 'Disable Ban Protection', description: 'Turn off reply limits' },
+  { command: '/deactivate bug_protection', title: 'Disable Bug Protection', description: 'Turn off detailed error capture' },
+  { command: '/deactivate soam_protection', title: 'Disable SOAM Protection', description: 'Turn off abuse monitoring' }
+];
+const SELECTABLE_COMMANDS = COMMANDS.filter(item => item.command !== '/pair');
 let sock = null;
 let currentPhone = null;
 let currentStatus = 'disconnected';
@@ -159,6 +172,15 @@ function phoneFromJid(jid) {
   const value = String(jid || '');
   if (!value.endsWith('@s.whatsapp.net')) return '';
   return value.split('@')[0].split(':')[0].replace(/\D/g, '');
+}
+function phoneFromUser(user) {
+  for (const candidate of [user?.phoneNumber, user?.id, user?.jid]) {
+    const value = String(candidate || '').trim();
+    const fromJid = phoneFromJid(value);
+    if (fromJid) return fromJid;
+    if (/^\+?\d{8,15}$/.test(value)) return value.replace(/\D/g, '');
+  }
+  return '';
 }
 function jidUser(jid) { return String(jid || '').split('@')[0].split(':')[0]; }
 function isRegisteredCredsFile(credsPath) {
@@ -256,7 +278,12 @@ async function sendBrandedText(jid, title, body, buttons = [], phone = getOwnerP
   for (const button of STANDARD_BUTTONS) {
     if (!allButtons.some(existing => (button.id && existing.id === button.id) || (button.url && existing.url === button.url))) allButtons.push(button);
   }
-  const nativeButtons = allButtons.map(button => ({
+  // WhatsApp native-flow messages allow at most three visible buttons. Keep two
+  // actions and reserve the final slot for the channel CTA.
+  const channelButton = allButtons.find(button => button.url === CHANNEL_URL);
+  const actionButtons = allButtons.filter(button => button !== channelButton).slice(0, 2);
+  const visibleButtons = [...actionButtons, ...(channelButton ? [channelButton] : [])];
+  const nativeButtons = visibleButtons.map(button => ({
     name: button.url ? 'cta_url' : 'quick_reply',
     buttonParamsJson: JSON.stringify(button.url ? { display_text: button.label, url: button.url } : { display_text: button.label, id: button.id })
   }));
@@ -288,16 +315,7 @@ async function sendMenu(jid, phone, { mentions = [] } = {}) {
     'Welcome. Send any command below to manage your connected bot.',
     '',
     '*COMMANDS*',
-    '/pair',
-    '/menu',
-    '/developers',
-    '/status',
-    '/activate ban_protection',
-    '/activate bug_protection',
-    '/activate soam_protection',
-    '/deactivate ban_protection',
-    '/deactivate bug_protection',
-    '/deactivate soam_protection',
+    ...COMMANDS.map(item => item.command),
     '',
     'Independent security tooling. Not affiliated with WhatsApp or Meta.'
   ].join('\n');
@@ -329,8 +347,17 @@ function buildMenuPayload(caption, uploadedMedia, contextInfo) {
     footer: { text: 'WhatsApp Protection · Independent project' },
     nativeFlowMessage: { buttons: [
       { name: 'quick_reply', buttonParamsJson: JSON.stringify({ display_text: 'Developers', id: 'wp_developers' }) },
-      { name: 'quick_reply', buttonParamsJson: JSON.stringify({ display_text: 'Commands', id: 'wp_commands' }) },
-      { name: 'quick_reply', buttonParamsJson: JSON.stringify({ display_text: 'Status', id: '/status' }) },
+      { name: 'single_select', buttonParamsJson: JSON.stringify({
+        title: 'Choose a command',
+        sections: [{
+          title: 'Available commands',
+          rows: SELECTABLE_COMMANDS.map(item => ({
+            title: item.title,
+            description: item.command,
+            id: item.command
+          }))
+        }]
+      }) },
       { name: 'cta_url', buttonParamsJson: JSON.stringify({ display_text: 'WhatsApp Channel', url: CHANNEL_URL }) }
     ] },
     ...(contextInfo ? { contextInfo } : {})
@@ -338,12 +365,17 @@ function buildMenuPayload(caption, uploadedMedia, contextInfo) {
 }
 
 function extractIncomingAction(message = {}) {
-  const msg = message.ephemeralMessage?.message || message.viewOnceMessage?.message || message;
+  const msg = normalizeMessageContent(message) || message;
   const text = msg.conversation || msg.extendedTextMessage?.text || msg.imageMessage?.caption || msg.videoMessage?.caption || '';
   const buttonId = msg.buttonsResponseMessage?.selectedButtonId || msg.templateButtonReplyMessage?.selectedId || msg.listResponseMessage?.singleSelectReply?.selectedRowId || '';
   let nativeId = '';
   const params = msg.interactiveResponseMessage?.nativeFlowResponseMessage?.paramsJson;
-  if (params) { try { const parsed = JSON.parse(params); nativeId = parsed.id || parsed.button_id || parsed.selected_id || ''; } catch (_) {} }
+  if (params) {
+    try {
+      const parsed = JSON.parse(params);
+      nativeId = parsed.id || parsed.button_id || parsed.selected_id || parsed.selected_row_id || parsed.selectedRowId || parsed.command || '';
+    } catch (_) {}
+  }
   return String(buttonId || nativeId || text).trim();
 }
 function observeInboundActivity(msg) {
@@ -528,7 +560,7 @@ async function startLinkedSessionInternal(phone, { requestCode = false, pairingD
       const { connection, lastDisconnect } = update;
       if (connection === 'open') {
         clearTimeout(record.expiryTimer);
-        const registeredPhone = phoneFromJid(activeSock.user?.id);
+        const registeredPhone = phoneFromUser(activeSock.user);
         if (registeredPhone && registeredPhone !== phone) {
           record.status = 'revoked';
           record.intentionalClose = true;
@@ -677,7 +709,7 @@ function resolveCommandSender(msg, activeSock = sock) {
   const jid = msg.key.remoteJid;
   // Every session runs on its user's own account, so commands that user types in any chat or
   // group arrive as their own (fromMe) messages, and the reply goes to that same chat.
-  if (msg.key.fromMe) return phoneFromJid(activeSock?.user?.id) || '';
+  if (msg.key.fromMe) return phoneFromUser(activeSock?.user);
   for (const candidate of [msg.key.participantAlt, msg.key.remoteJidAlt, msg.key.participant, jid]) {
     const phone = phoneFromJid(candidate);
     if (phone) return phone;
@@ -686,7 +718,7 @@ function resolveCommandSender(msg, activeSock = sock) {
 }
 
 function isOwnChat(msg, activeSock = sock) {
-  const ownIds = [jidUser(activeSock?.user?.id), jidUser(activeSock?.user?.lid)].filter(Boolean);
+  const ownIds = [jidUser(activeSock?.user?.id), jidUser(activeSock?.user?.lid), phoneFromUser(activeSock?.user)].filter(Boolean);
   return [jidUser(msg.key.remoteJid), jidUser(msg.key.remoteJidAlt)].filter(Boolean).some(user => ownIds.includes(user));
 }
 
@@ -699,7 +731,7 @@ async function handleCommand(msg, activeSock = sock) {
   const sender = resolveCommandSender(msg, activeSock);
   if (!sender) {
     if (!msg.key.fromMe && action.toLowerCase() === '/pair' && !msg.key.participant) {
-      await sendBotPayload(jid, s => s.sendMessage(jid, { text: 'Your phone number could not be verified from this chat. Make sure your number is visible to the bot and try /pair again.' }));
+      await sendBrandedText(jid, 'NUMBER NOT VERIFIED', 'Your phone number could not be verified from this chat. Make sure your number is visible to the bot and try /pair again.');
     }
     return;
   }
@@ -713,21 +745,33 @@ async function handleCommand(msg, activeSock = sock) {
   // chat: the incoming WhatsApp message itself proves control of the requesting number.
   if (command === '/pair') {
     if (!(jid.endsWith('@s.whatsapp.net') || jid.endsWith('@lid')) || msg.key.participant) {
-      await sendBotPayload(jid, activeSock => activeSock.sendMessage(jid, { text: 'For security, send /pair in a private chat with this bot, not in a group.' }), sender);
+      await sendBrandedText(jid, 'PAIR IN A PRIVATE CHAT', 'For security, send /pair in a private chat with this bot, not in a group.', [], sender, { mentions: [`${sender}@s.whatsapp.net`] });
       return;
     }
     if (isOwner) {
-      await sendBotPayload(jid, activeSock => activeSock.sendMessage(jid, { text: 'This number is already the primary bot owner. It does not need a second linked-device pairing.' }), sender);
+      await sendBrandedText(
+        jid,
+        'PAIRING NOT REQUIRED',
+        '*This number is already the primary bot owner.*\n\n*It does not need a second linked-device pairing.*',
+        [],
+        sender,
+        { mentions: [`${sender}@s.whatsapp.net`] }
+      );
       return;
     }
     try {
       const result = await createLinkedPairing(sender, {
-        onCodeRefresh: newCode => sendBotPayload(jid, s => s.sendMessage(jid, { text: `WhatsApp expired the previous code. Your new device-linking code is:\n\n\`\`\`${newCode}\`\`\`` }), sender)
+        onCodeRefresh: newCode => sendBrandedText(
+          jid,
+          'PAIRING CODE UPDATED',
+          `WhatsApp expired the previous code. Your new device-linking code is:\n\n\`\`\`${newCode}\`\`\``,
+          [],
+          sender,
+          { mentions: [`${sender}@s.whatsapp.net`] }
+        )
       });
       if (result.code) {
         const reply = [
-          '*WHATSAPP PROTECTION — DEVICE LINKING*',
-          '',
           'Your genuine WhatsApp device-linking code is:',
           '',
           '```' + result.code + '```',
@@ -737,13 +781,13 @@ async function handleCommand(msg, activeSock = sock) {
           '',
           'After the account connects, send /menu from your own WhatsApp in any chat or group to use the bot.'
         ].join('\n');
-        await sendBotPayload(jid, activeSock => activeSock.sendMessage(jid, { text: reply }), sender);
+        await sendBrandedText(jid, 'WHATSAPP PROTECTION — DEVICE LINKING', reply, [], sender, { mentions: [`${sender}@s.whatsapp.net`] });
       } else {
-        await sendBotPayload(jid, activeSock => activeSock.sendMessage(jid, { text: result.message || 'This WhatsApp number is already paired.' }), sender);
+        await sendBrandedText(jid, 'DEVICE ALREADY PAIRED', result.message || 'This WhatsApp number is already paired.', [], sender, { mentions: [`${sender}@s.whatsapp.net`] });
       }
     } catch (error) {
       safeLogError(error, 'Device pairing command failed', sender);
-      await sendBotPayload(jid, activeSock => activeSock.sendMessage(jid, { text: `Pairing could not be started: ${String(error.message || error).slice(0, 250)}` }), sender);
+      await sendBrandedText(jid, 'PAIRING COULD NOT START', String(error.message || error).slice(0, 250), [], sender, { mentions: [`${sender}@s.whatsapp.net`] });
     }
     return;
   }
@@ -757,7 +801,14 @@ async function handleCommand(msg, activeSock = sock) {
     if (!msg.key.fromMe && !msg.key.participant && !jid.endsWith('@g.us') && (unauthorizedNotices.get(sender) || 0) < now) {
       unauthorizedNotices.set(sender, now + 10 * 60_000);
       if (unauthorizedNotices.size > 3000) { for (const [key, until] of unauthorizedNotices) if (until < now) unauthorizedNotices.delete(key); }
-      await sendBotPayload(jid, s => s.sendMessage(jid, { text: 'This number is not paired with WhatsApp Protection yet, so commands are not available. Send /pair here (or pair on the website) to link your number; after it connects, send /menu from your own WhatsApp in any chat or group.' }), sender);
+      await sendBrandedText(
+        jid,
+        'PAIRING REQUIRED',
+        'This number is not paired with WhatsApp Protection yet, so commands are not available. Send /pair here (or pair on the website) to link your number; after it connects, send /menu from your own WhatsApp in any chat or group.',
+        [],
+        sender,
+        { mentions: [`${sender}@s.whatsapp.net`] }
+      );
     }
     return;
   }
@@ -767,7 +818,7 @@ async function handleCommand(msg, activeSock = sock) {
   const reply = (title, body, buttons = []) => sendBrandedText(jid, title, body, buttons, phone, { mentions });
   if (command === '/menu' || command === 'wp_menu') { await sendMenu(jid, phone, { mentions }); return; }
   if (command === 'wp_commands') {
-    await reply('COMMANDS', ['/pair', '/menu', '/developers', '/status', '/activate ban_protection', '/activate bug_protection', '/activate soam_protection', '/deactivate ban_protection', '/deactivate bug_protection', '/deactivate soam_protection'].join('\n'));
+    await reply('COMMANDS', COMMANDS.map(item => item.command).join('\n'));
     insertLog.run(phone, 'command_list_button', action); return;
   }
   if (command === 'wp_developers' || command === '/developers') {
@@ -846,7 +897,7 @@ async function startSocket(phoneForPairing = null, requestCode = false) {
       if (connection === 'open') {
         clearTimeout(primaryPairingTimer); primaryPairingTimer = null;
         currentStatus = 'connected'; primaryPairingCode = null; reconnectAttempt = 0;
-        const registeredPhone = phoneFromJid(activeSock.user?.id) || currentPhone;
+        const registeredPhone = phoneFromUser(activeSock.user) || currentPhone;
         if (registeredPhone) { currentPhone = registeredPhone; setPair.run(registeredPhone, 'connected'); insertPairEvent.run(registeredPhone, 'connected', 'Baileys connection opened'); insertLog.run(registeredPhone, 'connection_open', 'WhatsApp connected'); }
         if (featureEnabled('bug_protection', registeredPhone)) insertSecurityEvent.run(registeredPhone, null, 'info', 'connection_recovered', 'WhatsApp connection opened successfully');
         log.info('WhatsApp connected');
@@ -1120,6 +1171,6 @@ if (isMainModule) start();
 // Internal hooks used by the automated test suite (test/). Not part of the public HTTP API.
 export const testing = {
   app, db, handleCommand, waitForPairingChallenge, pairingRefreshAllowed, replyContext, waSocketOptions, PAIRING_QR_REF_MS, linkedSessions, linkedPairingState, issueLinkedPairingToken, isPrimaryPairingRequest, resolveCommandSender, followChannelForPrimaryAccount, followChannelForLinkedAccount, featureEnabled,
-  setPrimarySocket(activeSock, status = 'connected') { sock = activeSock; currentStatus = status; if (activeSock?.user?.id) currentPhone = phoneFromJid(activeSock.user.id); },
+  setPrimarySocket(activeSock, status = 'connected') { sock = activeSock; currentStatus = status; if (activeSock?.user) currentPhone = phoneFromUser(activeSock.user); },
   CHANNEL_CODE, CHANNEL_JID, CHANNEL_URL
 };

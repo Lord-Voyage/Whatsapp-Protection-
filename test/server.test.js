@@ -186,12 +186,40 @@ test('LID-only senders are not treated as phone numbers', async () => {
   assert.equal(featureEnabled('bug_protection', LINKED), true, 'remoteJidAlt phone number is used when present');
 });
 
+test('linked users with a LID Baileys id can run every command through their own session', async () => {
+  const USER = '256700000078';
+  db.prepare("INSERT INTO linked_devices(phone,status,session_status) VALUES(?,?,?)").run(USER, 'active', 'connected');
+  const linkedSock = fakeSocket({ user: { id: 'opaque-user:3@lid', phoneNumber: `${USER}@s.whatsapp.net`, lid: 'opaque-user:3@lid' } });
+  testing.setPrimarySocket(linkedSock);
+  testing.linkedSessions.set(USER, { status: 'connected', socket: linkedSock });
+  const self = command => ({ key: { remoteJid: `${USER}@s.whatsapp.net`, fromMe: true, id: `linked-${command}` }, message: { conversation: command } });
+  try {
+    for (const command of [
+      '/pair', '/menu', '/developers', '/status',
+      '/activate ban_protection', '/activate bug_protection', '/activate soam_protection',
+      '/deactivate ban_protection', '/deactivate bug_protection', '/deactivate soam_protection'
+    ]) {
+      const before = linkedSock.calls.all.length;
+      await testing.replyContext.run({ socket: linkedSock, isOpen: () => true }, () => handleCommand(self(command), linkedSock));
+      assert.equal(linkedSock.calls.all.length, before + 1, `${command} sends a response`);
+      assert.notEqual(lastText(linkedSock), '', `${command} has a readable response`);
+    }
+    assert.equal(featureEnabled('ban_protection', USER), false);
+    assert.equal(featureEnabled('bug_protection', USER), false);
+    assert.equal(featureEnabled('soam_protection', USER), false);
+  } finally {
+    testing.linkedSessions.delete(USER);
+  }
+});
+
 test('/pair is refused in groups and for the owner', async () => {
   const sock = fakeSocket(); setPrimarySocket(sock);
   await handleCommand({ key: { remoteJid: '1203630000@g.us', participant: `${STRANGER}@s.whatsapp.net`, fromMe: false, id: 'g' }, message: { conversation: '/pair' } }, sock);
   assert.match(lastText(sock), /private chat/);
   await handleCommand(selfChat('/pair'), sock);
-  assert.match(lastText(sock), /already the primary bot owner/);
+  const ownerNotice = interactiveOf(sock.calls.all.at(-1))?.body?.text || '';
+  assert.match(ownerNotice, /\*This number is already the primary bot owner\.\*/);
+  assert.match(ownerNotice, /\*It does not need a second linked-device pairing\.\*/);
 });
 
 test('SOAM cooldown blocks command floods without crashing', async () => {
@@ -206,26 +234,49 @@ test('menu and every command reply carry buttons and the channel banner; the men
   const menu = interactiveOf(sock.calls.all.at(-1));
   assert.ok(menu, 'menu is a button message');
   assert.ok(menu.header?.imageMessage, 'menu keeps the logo image');
+  assert.equal(menu.nativeFlowMessage.buttons.length, 3, 'the menu stays within WhatsApp native-flow button limits');
   assert.equal(menu.contextInfo.forwardedNewsletterMessageInfo.newsletterJid, '120363409908822540@newsletter');
   assert.equal(menu.contextInfo.isForwarded, true);
   const menuButtons = menu.nativeFlowMessage.buttons.map(b => JSON.parse(b.buttonParamsJson));
   assert.ok(menuButtons.some(b => b.url === testing.CHANNEL_URL), 'menu has the channel button');
+  const commandPicker = menu.nativeFlowMessage.buttons.find(b => b.name === 'single_select');
+  assert.ok(commandPicker, 'menu includes a native command picker');
+  const rows = JSON.parse(commandPicker.buttonParamsJson).sections.flatMap(section => section.rows);
   const html = fs.readFileSync(new URL('../public/docs/commands.html', import.meta.url), 'utf8');
   const documented = [...html.matchAll(/<code>(\/[a-z_ ]+)<\/code>/g)].map(m => m[1].trim());
   assert.ok(documented.length >= 10);
   for (const command of documented) assert.ok(menu.body.text.includes(command), `menu lists ${command}`);
+  for (const command of documented.filter(command => command !== '/pair')) {
+    assert.ok(rows.some(row => row.id === command && row.description === command), `picker includes ${command}`);
+  }
   for (const command of documented.filter(c => c !== '/pair')) {
     const count = sock.calls.all.length;
     await handleCommand(selfChat(command), sock);
     assert.equal(sock.calls.all.length, count + 1, `${command} replies`);
     const reply = interactiveOf(sock.calls.all.at(-1));
-    assert.ok(reply?.nativeFlowMessage?.buttons?.length >= 3, `${command} reply has buttons`);
+    assert.equal(reply?.nativeFlowMessage?.buttons?.length, 3, `${command} reply has at most three visible buttons`);
+    assert.ok(reply.nativeFlowMessage.buttons.some(button => JSON.parse(button.buttonParamsJson).url === testing.CHANNEL_URL), `${command} reply retains the channel CTA`);
     assert.equal(reply.contextInfo.forwardedNewsletterMessageInfo.newsletterJid, testing.CHANNEL_JID);
     assert.doesNotMatch(lastText(sock), /UNKNOWN COMMAND/, `${command} is handled`);
   }
-  const statusButton = menuButtons.find(b => b.id === '/status');
+  const statusRow = rows.find(row => row.id === '/status');
   const count = sock.calls.all.length;
-  await handleCommand({ key: { remoteJid: `${OWNER}@s.whatsapp.net`, fromMe: true, id: 'btn' }, message: { interactiveResponseMessage: { nativeFlowResponseMessage: { paramsJson: JSON.stringify({ id: statusButton.id }) } } } }, sock);
+  await handleCommand({
+    key: { remoteJid: `${OWNER}@s.whatsapp.net`, fromMe: true, id: 'btn' },
+    message: {
+      ephemeralMessage: {
+        message: {
+          viewOnceMessage: {
+            message: {
+              interactiveResponseMessage: {
+                nativeFlowResponseMessage: { paramsJson: JSON.stringify({ selected_row_id: statusRow.id }) }
+              }
+            }
+          }
+        }
+      }
+    }
+  }, sock);
   assert.equal(sock.calls.all.length, count + 1);
   assert.match(lastText(sock), /PROTECTION STATUS/, 'tapping a button runs its command');
 });
