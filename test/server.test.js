@@ -186,6 +186,28 @@ test('LID-only senders are not treated as phone numbers', async () => {
   assert.equal(featureEnabled('bug_protection', LINKED), true, 'remoteJidAlt phone number is used when present');
 });
 
+test('self-chat commands use readable standard replies when the message has a LID alias', async () => {
+  const sock = fakeSocket({ user: { id: 'opaque-self:3@lid', lid: 'opaque-self:3@lid' } });
+  testing.setPrimarySocket(sock);
+  const self = command => ({
+    key: { remoteJid: 'opaque-self:3@lid', remoteJidAlt: `${OWNER}@s.whatsapp.net`, fromMe: true, id: `self-${command}` },
+    message: { conversation: command }
+  });
+  await handleCommand(self('/menu'), sock);
+  const menu = sock.calls.sent.at(-1).content;
+  assert.ok(Buffer.isBuffer(menu.image), 'self-chat menu is sent as a readable image/caption');
+  assert.match(menu.caption, /\/status/);
+  assert.match(menu.caption, /whatsapp\.com\/channel/);
+  await handleCommand(self('/status'), sock);
+  assert.match(sock.calls.sent.at(-1).content.text, /PROTECTION STATUS/);
+  assert.match(sock.calls.sent.at(-1).content.text, /whatsapp\.com\/channel/);
+  await handleCommand(self('/developers'), sock);
+  assert.match(sock.calls.sent.at(-1).content.text, /wa\.me\/256702662846/);
+  await handleCommand(self('/pair'), sock);
+  assert.match(lastText(sock), /\*This number is already the primary bot owner\.\*/);
+  assert.equal(sock.calls.relayed.length, 0, 'self-chat responses do not rely on native-flow rendering');
+});
+
 test('linked users with a LID Baileys id can run every command through their own session', async () => {
   const USER = '256700000078';
   db.prepare("INSERT INTO linked_devices(phone,status,session_status) VALUES(?,?,?)").run(USER, 'active', 'connected');
@@ -217,7 +239,7 @@ test('/pair is refused in groups and for the owner', async () => {
   await handleCommand({ key: { remoteJid: '1203630000@g.us', participant: `${STRANGER}@s.whatsapp.net`, fromMe: false, id: 'g' }, message: { conversation: '/pair' } }, sock);
   assert.match(lastText(sock), /private chat/);
   await handleCommand(selfChat('/pair'), sock);
-  const ownerNotice = interactiveOf(sock.calls.all.at(-1))?.body?.text || '';
+  const ownerNotice = lastText(sock);
   assert.match(ownerNotice, /\*This number is already the primary bot owner\.\*/);
   assert.match(ownerNotice, /\*It does not need a second linked-device pairing\.\*/);
 });
@@ -229,8 +251,11 @@ test('SOAM cooldown blocks command floods without crashing', async () => {
 });
 
 test('menu and every command reply carry buttons and the channel banner; the menu lists every documented command', async () => {
+  const USER = '256700000091';
+  db.prepare("INSERT INTO linked_devices(phone,status,session_status) VALUES(?,?,?)").run(USER, 'active', 'connected');
   const sock = fakeSocket(); setPrimarySocket(sock);
-  await handleCommand(selfChat('/menu'), sock);
+  const commandMessage = command => dm(USER, command);
+  await handleCommand(commandMessage('/menu'), sock);
   const menu = interactiveOf(sock.calls.all.at(-1));
   assert.ok(menu, 'menu is a button message');
   assert.ok(menu.header?.imageMessage, 'menu keeps the logo image');
@@ -251,7 +276,7 @@ test('menu and every command reply carry buttons and the channel banner; the men
   }
   for (const command of documented.filter(c => c !== '/pair')) {
     const count = sock.calls.all.length;
-    await handleCommand(selfChat(command), sock);
+    await handleCommand(commandMessage(command), sock);
     assert.equal(sock.calls.all.length, count + 1, `${command} replies`);
     const reply = interactiveOf(sock.calls.all.at(-1));
     assert.equal(reply?.nativeFlowMessage?.buttons?.length, 3, `${command} reply has at most three visible buttons`);
@@ -262,7 +287,7 @@ test('menu and every command reply carry buttons and the channel banner; the men
   const statusRow = rows.find(row => row.id === '/status');
   const count = sock.calls.all.length;
   await handleCommand({
-    key: { remoteJid: `${OWNER}@s.whatsapp.net`, fromMe: true, id: 'btn' },
+    key: { remoteJid: `${USER}@s.whatsapp.net`, fromMe: false, id: 'btn' },
     message: {
       ephemeralMessage: {
         message: {
@@ -298,12 +323,14 @@ test('INTERACTIVE_BUTTONS=false sends standard messages that still carry the cha
 });
 
 test('button messages are sent through baileys_helper with a standard fallback', async () => {
+  const USER = '256700000092';
+  db.prepare("INSERT INTO linked_devices(phone,status,session_status) VALUES(?,?,?)").run(USER, 'active', 'connected');
   const sock = fakeSocket(); setPrimarySocket(sock);
-  await handleCommand(selfChat('/developers'), sock);
+  await handleCommand(dm(USER, '/developers'), sock);
   assert.equal(sock.calls.relayed.length, 1);
   assert.ok(sock.calls.relayed[0].message.interactiveMessage || sock.calls.relayed[0].message.viewOnceMessage);
   const broken = fakeSocket(); broken.relayMessage = async () => { throw new Error('relay failed'); }; setPrimarySocket(broken);
-  await handleCommand(selfChat('/developers'), broken);
+  await handleCommand(dm(USER, '/developers'), broken);
   assert.match(lastText(broken), /wa\.me\/256702662846/);
 });
 

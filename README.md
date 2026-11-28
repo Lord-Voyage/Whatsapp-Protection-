@@ -66,6 +66,8 @@ The dashboard is read-only. There are no public administrator endpoints. Protect
 
 - Pairing codes from `/pair` expire after 10 minutes; unfinished pairing sessions and their temporary auth files are removed automatically.
 - `MAX_LINKED_ACCOUNTS` (default 100, `0` = unlimited) only exists because every linked account is a separate live WhatsApp connection using server memory; raise it to match your instance size.
+- Run only one bot process per saved WhatsApp session. If WhatsApp reports that a session was replaced, automatic reconnect stops to prevent a rapid conflict loop; stop the other copy and restart this one.
+- Commands sent from WhatsApp's “Message yourself” chat receive standard text/image replies for reliable display. Native-flow buttons are used in other chats.
 - Pairing and real WhatsApp messaging require a live compatible WhatsApp account and network access; these cannot be fully tested without linking an account.
 - Native-flow button appearance and callbacks must be tested with the deployed Baileys version and current WhatsApp clients.
 - The bot does not scan the phone or uploaded files, detect all account compromise, reverse bans, or guarantee immunity from WhatsApp enforcement.

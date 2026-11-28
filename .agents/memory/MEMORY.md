@@ -1,0 +1,1 @@
+- [WhatsApp self-chat delivery](whatsapp-self-chat-delivery.md) — use standard replies in “Message yourself” chats; native-flow replies may not display there.

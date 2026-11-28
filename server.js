@@ -272,7 +272,7 @@ async function sendBotPayload(jid, sendFn, phone = getOwnerPhone()) {
 async function sendText(jid, text) {
   return sendBotPayload(jid, activeSock => activeSock.sendMessage(jid, { text }));
 }
-async function sendBrandedText(jid, title, body, buttons = [], phone = getOwnerPhone(), { mentions = [] } = {}) {
+async function sendBrandedText(jid, title, body, buttons = [], phone = getOwnerPhone(), { mentions = [], forceStandard = false } = {}) {
   if (!replySocket()) return;
   const allButtons = [...buttons];
   for (const button of STANDARD_BUTTONS) {
@@ -290,7 +290,7 @@ async function sendBrandedText(jid, title, body, buttons = [], phone = getOwnerP
   const text = `*${title}*\n\n${body}`;
   const links = allButtons.filter(button => button.url).map(button => `${button.label}: ${button.url}`).join('\n');
   const sendStandard = activeSock => activeSock.sendMessage(jid, { text: links && !text.includes(links) ? `${text}\n\n${links}` : text, contextInfo: channelContext(mentions) });
-  if (!interactiveButtonsEnabled()) return sendBotPayload(jid, sendStandard, phone);
+  if (!interactiveButtonsEnabled() || forceStandard) return sendBotPayload(jid, sendStandard, phone);
   const payload = { interactiveMessage: {
     header: { title: 'WhatsApp Protection', hasMediaAttachment: false },
     body: { text },
@@ -307,7 +307,7 @@ async function sendBrandedText(jid, title, body, buttons = [], phone = getOwnerP
   }, phone);
 }
 
-async function sendMenu(jid, phone, { mentions = [] } = {}) {
+async function sendMenu(jid, phone, { mentions = [], forceStandard = false } = {}) {
   if (!replySocket()) return;
   const caption = [
     '*WHATSAPP PROTECTION*',
@@ -328,7 +328,7 @@ async function sendMenu(jid, phone, { mentions = [] } = {}) {
     }
   };
   await sendBotPayload(jid, async activeSock => {
-    if (!interactiveButtonsEnabled()) return sendStandardMenu(activeSock);
+    if (!interactiveButtonsEnabled() || forceStandard) return sendStandardMenu(activeSock);
     try {
       const uploadedMedia = await prepareWAMessageMedia({ image: fs.readFileSync(MENU_IMAGE) }, { upload: activeSock.waUploadToServer });
       return await sendInteractiveMessage(activeSock, jid, buildMenuPayload(caption, uploadedMedia, channelContext(mentions)));
@@ -546,7 +546,7 @@ async function startLinkedSessionInternal(phone, { requestCode = false, pairingD
   activeSock.ev.on('creds.update', saveCreds);
   // A linked user runs the bot on their own account: only their own messages, in any chat or
   // group, are commands; messages other people send them are ignored.
-  const linkedReplyContext = { socket: activeSock, isOpen: () => record.socket === activeSock && record.status === 'connected' };
+  const linkedReplyContext = { socket: activeSock, phone, isOpen: () => record.socket === activeSock && record.status === 'connected' };
   activeSock.ev.on('messages.upsert', async ({ messages, type }) => {
     if (type !== 'notify') return;
     for (const msg of messages || []) {
@@ -594,6 +594,13 @@ async function startLinkedSessionInternal(phone, { requestCode = false, pairingD
           fs.rmSync(authPath, { recursive: true, force: true });
           insertPairEvent.run(phone, 'logged_out', `WhatsApp logged out; status ${code ?? 'unknown'}`);
           if (linkedSessions.get(phone) === record) linkedSessions.delete(phone);
+          return;
+        }
+        if (code === DisconnectReason.connectionReplaced) {
+          record.status = 'connection_replaced';
+          setLinkedSessionStatus.run('connection_replaced', phone);
+          insertPairEvent.run(phone, 'connection_replaced', 'Another WhatsApp client replaced this linked session; automatic reconnect stopped');
+          log.warn({ phone }, 'Linked session was replaced; stop this bot copy before reconnecting');
           return;
         }
         if (!canReconnect) {
@@ -709,7 +716,13 @@ function resolveCommandSender(msg, activeSock = sock) {
   const jid = msg.key.remoteJid;
   // Every session runs on its user's own account, so commands that user types in any chat or
   // group arrive as their own (fromMe) messages, and the reply goes to that same chat.
-  if (msg.key.fromMe) return phoneFromUser(activeSock?.user);
+  if (msg.key.fromMe) {
+    return phoneFromUser(activeSock?.user)
+      || phoneFromJid(msg.key.remoteJidAlt)
+      || phoneFromJid(msg.key.participantAlt)
+      || phoneFromJid(jid)
+      || '';
+  }
   for (const candidate of [msg.key.participantAlt, msg.key.remoteJidAlt, msg.key.participant, jid]) {
     const phone = phoneFromJid(candidate);
     if (phone) return phone;
@@ -718,8 +731,17 @@ function resolveCommandSender(msg, activeSock = sock) {
 }
 
 function isOwnChat(msg, activeSock = sock) {
-  const ownIds = [jidUser(activeSock?.user?.id), jidUser(activeSock?.user?.lid), phoneFromUser(activeSock?.user)].filter(Boolean);
-  return [jidUser(msg.key.remoteJid), jidUser(msg.key.remoteJidAlt)].filter(Boolean).some(user => ownIds.includes(user));
+  const context = replyContext.getStore();
+  const linkedPhone = context?.socket === activeSock ? context.phone : '';
+  const ownPhones = [
+    phoneFromUser(activeSock?.user),
+    linkedPhone,
+    activeSock === sock ? currentPhone : ''
+  ].filter(Boolean);
+  const ownIds = [jidUser(activeSock?.user?.id), jidUser(activeSock?.user?.lid), ...ownPhones].filter(Boolean);
+  const messageIds = [jidUser(msg.key.remoteJid), jidUser(msg.key.remoteJidAlt)].filter(Boolean);
+  const messagePhones = [phoneFromJid(msg.key.remoteJid), phoneFromJid(msg.key.remoteJidAlt)].filter(Boolean);
+  return messageIds.some(user => ownIds.includes(user)) || messagePhones.some(phone => ownPhones.includes(phone));
 }
 
 async function handleCommand(msg, activeSock = sock) {
@@ -740,12 +762,13 @@ async function handleCommand(msg, activeSock = sock) {
   const isOwner = Boolean(owner && sender === owner);
   if (!checkSoam(sender, action, sender)) return;
   const command = action.toLowerCase().replace(/\s+/g, ' ');
+  const selfChat = isOwnChat(msg, activeSock);
 
   // /pair is intentionally available to unpaired users, but only from a private
   // chat: the incoming WhatsApp message itself proves control of the requesting number.
   if (command === '/pair') {
     if (!(jid.endsWith('@s.whatsapp.net') || jid.endsWith('@lid')) || msg.key.participant) {
-      await sendBrandedText(jid, 'PAIR IN A PRIVATE CHAT', 'For security, send /pair in a private chat with this bot, not in a group.', [], sender, { mentions: [`${sender}@s.whatsapp.net`] });
+      await sendBrandedText(jid, 'PAIR IN A PRIVATE CHAT', 'For security, send /pair in a private chat with this bot, not in a group.', [], sender, { mentions: [`${sender}@s.whatsapp.net`], forceStandard: selfChat });
       return;
     }
     if (isOwner) {
@@ -755,7 +778,7 @@ async function handleCommand(msg, activeSock = sock) {
         '*This number is already the primary bot owner.*\n\n*It does not need a second linked-device pairing.*',
         [],
         sender,
-        { mentions: [`${sender}@s.whatsapp.net`] }
+        { mentions: [`${sender}@s.whatsapp.net`], forceStandard: selfChat }
       );
       return;
     }
@@ -767,7 +790,7 @@ async function handleCommand(msg, activeSock = sock) {
           `WhatsApp expired the previous code. Your new device-linking code is:\n\n\`\`\`${newCode}\`\`\``,
           [],
           sender,
-          { mentions: [`${sender}@s.whatsapp.net`] }
+          { mentions: [`${sender}@s.whatsapp.net`], forceStandard: selfChat }
         )
       });
       if (result.code) {
@@ -781,13 +804,13 @@ async function handleCommand(msg, activeSock = sock) {
           '',
           'After the account connects, send /menu from your own WhatsApp in any chat or group to use the bot.'
         ].join('\n');
-        await sendBrandedText(jid, 'WHATSAPP PROTECTION — DEVICE LINKING', reply, [], sender, { mentions: [`${sender}@s.whatsapp.net`] });
+        await sendBrandedText(jid, 'WHATSAPP PROTECTION — DEVICE LINKING', reply, [], sender, { mentions: [`${sender}@s.whatsapp.net`], forceStandard: selfChat });
       } else {
-        await sendBrandedText(jid, 'DEVICE ALREADY PAIRED', result.message || 'This WhatsApp number is already paired.', [], sender, { mentions: [`${sender}@s.whatsapp.net`] });
+        await sendBrandedText(jid, 'DEVICE ALREADY PAIRED', result.message || 'This WhatsApp number is already paired.', [], sender, { mentions: [`${sender}@s.whatsapp.net`], forceStandard: selfChat });
       }
     } catch (error) {
       safeLogError(error, 'Device pairing command failed', sender);
-      await sendBrandedText(jid, 'PAIRING COULD NOT START', String(error.message || error).slice(0, 250), [], sender, { mentions: [`${sender}@s.whatsapp.net`] });
+      await sendBrandedText(jid, 'PAIRING COULD NOT START', String(error.message || error).slice(0, 250), [], sender, { mentions: [`${sender}@s.whatsapp.net`], forceStandard: selfChat });
     }
     return;
   }
@@ -807,7 +830,7 @@ async function handleCommand(msg, activeSock = sock) {
         'This number is not paired with WhatsApp Protection yet, so commands are not available. Send /pair here (or pair on the website) to link your number; after it connects, send /menu from your own WhatsApp in any chat or group.',
         [],
         sender,
-        { mentions: [`${sender}@s.whatsapp.net`] }
+        { mentions: [`${sender}@s.whatsapp.net`], forceStandard: selfChat }
       );
     }
     return;
@@ -815,8 +838,8 @@ async function handleCommand(msg, activeSock = sock) {
 
   const phone = sender;
   const mentions = [`${sender}@s.whatsapp.net`];
-  const reply = (title, body, buttons = []) => sendBrandedText(jid, title, body, buttons, phone, { mentions });
-  if (command === '/menu' || command === 'wp_menu') { await sendMenu(jid, phone, { mentions }); return; }
+  const reply = (title, body, buttons = []) => sendBrandedText(jid, title, body, buttons, phone, { mentions, forceStandard: selfChat });
+  if (command === '/menu' || command === 'wp_menu') { await sendMenu(jid, phone, { mentions, forceStandard: selfChat }); return; }
   if (command === 'wp_commands') {
     await reply('COMMANDS', COMMANDS.map(item => item.command).join('\n'));
     insertLog.run(phone, 'command_list_button', action); return;
@@ -919,6 +942,16 @@ async function startSocket(phoneForPairing = null, requestCode = false) {
           clearPrimaryAuth();
           currentStatus = 'logged_out';
           log.warn('Primary WhatsApp session was logged out; pair again from /pair');
+          return;
+        }
+        if (code === DisconnectReason.connectionReplaced) {
+          clearTimeout(reconnectTimer); reconnectTimer = null;
+          currentStatus = 'connection_replaced';
+          if (currentPhone) {
+            setPair.run(currentPhone, 'connection_replaced');
+            insertPairEvent.run(currentPhone, 'connection_replaced', 'Another WhatsApp client replaced this primary session; automatic reconnect stopped');
+          }
+          log.warn('Primary session was replaced; stop the other bot copy before restarting this one');
           return;
         }
         if (!canReconnect) {
