@@ -208,6 +208,22 @@ test('self-chat commands use readable standard replies when the message has a LI
   assert.equal(sock.calls.relayed.length, 0, 'self-chat responses do not rely on native-flow rendering');
 });
 
+test('private chats receive readable standard replies and command shortcuts', async () => {
+  const USER = '256700000079';
+  db.prepare("INSERT INTO linked_devices(phone,status,session_status) VALUES(?,?,?)").run(USER, 'active', 'connected');
+  const sock = fakeSocket(); setPrimarySocket(sock);
+  await handleCommand(dm(USER, '/menu'), sock);
+  const menu = sock.calls.sent.at(-1).content;
+  assert.ok(Buffer.isBuffer(menu.image));
+  assert.match(menu.caption, /\/activate soam_protection/);
+  assert.match(menu.caption, /whatsapp\.com\/channel/);
+  await handleCommand(dm(USER, '/status'), sock);
+  assert.match(sock.calls.sent.at(-1).content.text, /PROTECTION STATUS/);
+  assert.match(sock.calls.sent.at(-1).content.text, /Menu: \/menu/);
+  assert.match(sock.calls.sent.at(-1).content.text, /WhatsApp Channel: https:\/\/whatsapp\.com\/channel/);
+  assert.equal(sock.calls.relayed.length, 0);
+});
+
 test('linked users with a LID Baileys id can run every command through their own session', async () => {
   const USER = '256700000078';
   db.prepare("INSERT INTO linked_devices(phone,status,session_status) VALUES(?,?,?)").run(USER, 'active', 'connected');
@@ -252,9 +268,13 @@ test('SOAM cooldown blocks command floods without crashing', async () => {
 
 test('menu and every command reply carry buttons and the channel banner; the menu lists every documented command', async () => {
   const USER = '256700000091';
+  const GROUP = '120363000091@g.us';
   db.prepare("INSERT INTO linked_devices(phone,status,session_status) VALUES(?,?,?)").run(USER, 'active', 'connected');
   const sock = fakeSocket(); setPrimarySocket(sock);
-  const commandMessage = command => dm(USER, command);
+  const commandMessage = command => ({
+    key: { remoteJid: GROUP, participant: `${USER}@s.whatsapp.net`, fromMe: false, id: `group-${command}` },
+    message: { conversation: command }
+  });
   await handleCommand(commandMessage('/menu'), sock);
   const menu = interactiveOf(sock.calls.all.at(-1));
   assert.ok(menu, 'menu is a button message');
@@ -287,7 +307,7 @@ test('menu and every command reply carry buttons and the channel banner; the men
   const statusRow = rows.find(row => row.id === '/status');
   const count = sock.calls.all.length;
   await handleCommand({
-    key: { remoteJid: `${USER}@s.whatsapp.net`, fromMe: false, id: 'btn' },
+    key: { remoteJid: GROUP, participant: `${USER}@s.whatsapp.net`, fromMe: false, id: 'btn' },
     message: {
       ephemeralMessage: {
         message: {
@@ -324,13 +344,15 @@ test('INTERACTIVE_BUTTONS=false sends standard messages that still carry the cha
 
 test('button messages are sent through baileys_helper with a standard fallback', async () => {
   const USER = '256700000092';
+  const GROUP = '120363000092@g.us';
   db.prepare("INSERT INTO linked_devices(phone,status,session_status) VALUES(?,?,?)").run(USER, 'active', 'connected');
   const sock = fakeSocket(); setPrimarySocket(sock);
-  await handleCommand(dm(USER, '/developers'), sock);
+  const groupCommand = { key: { remoteJid: GROUP, participant: `${USER}@s.whatsapp.net`, fromMe: false }, message: { conversation: '/developers' } };
+  await handleCommand(groupCommand, sock);
   assert.equal(sock.calls.relayed.length, 1);
   assert.ok(sock.calls.relayed[0].message.interactiveMessage || sock.calls.relayed[0].message.viewOnceMessage);
   const broken = fakeSocket(); broken.relayMessage = async () => { throw new Error('relay failed'); }; setPrimarySocket(broken);
-  await handleCommand(dm(USER, '/developers'), broken);
+  await handleCommand(groupCommand, broken);
   assert.match(lastText(broken), /wa\.me\/256702662846/);
 });
 

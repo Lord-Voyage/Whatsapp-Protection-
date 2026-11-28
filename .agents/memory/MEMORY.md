@@ -1,1 +1,1 @@
-- [WhatsApp self-chat delivery](whatsapp-self-chat-delivery.md) — use standard replies in “Message yourself” chats; native-flow replies may not display there.
+- [WhatsApp private-chat delivery](whatsapp-self-chat-delivery.md) — use standard replies in DMs; keep native-flow buttons in groups where they display.
